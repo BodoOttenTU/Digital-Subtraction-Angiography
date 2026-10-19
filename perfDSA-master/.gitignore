@@ -1,0 +1,8 @@
+/analysis_scripts/
+/wandb/
+/results/
+/data/ICAseg/
+/.idea/
+/.vscode/
+__pycache__/
+

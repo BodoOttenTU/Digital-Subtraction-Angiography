@@ -1,0 +1,82 @@
+# ---------------------------------------------------------------
+# Patient / imaging data — never commit
+# ---------------------------------------------------------------
+/EX_AGNES/
+/PRAISE/
+/PRAISE_BATCH_2/
+/perfDSA-master/data/*
+!/perfDSA-master/data/.keep
+
+# Medical image formats and archives
+*.IMA
+*.ima
+*.dcm
+*.DCM
+*.dicom
+*.nii
+*.nii.gz
+*.mha
+*.mhd
+*.raw
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+
+# Array / tabular data
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.mat
+*.pkl
+*.pickle
+*.csv
+*.tsv
+*.xlsx
+*.xls
+
+# ---------------------------------------------------------------
+# Outputs derived from patient data
+# ---------------------------------------------------------------
+/perfDSA-master/results/
+/perfDSA-master/analysis_scripts/
+/perfDSA-master/wandb/
+wandb/
+*.log
+
+# Model weights (trained on patient data)
+/perfDSA-master/models/*
+!/perfDSA-master/models/.keep
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Generated figures
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.gif
+*.mp4
+*.avi
+
+# ---------------------------------------------------------------
+# Python / editor / OS clutter
+# ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+.env
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini
+.DS_Store
+~$*
