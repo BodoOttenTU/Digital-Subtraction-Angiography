@@ -1,0 +1,175 @@
+% =====================================================================
+% DRAFT — SQ4: does the AIF variability change the perfusion maps? (AIF swap, tissue fixed)
+% Methods -> sections/02_methods.tex, Results -> sections/03_results.tex,
+% Discussion -> sections/04_discussion.tex. References: methods_aif_refs.bib.
+%
+% Show in the main text:
+%   Table~\ref{tab:sq4}          tables/table_sq4.tex                 (results/combined_v1/sq4_aif_swap/table_sq4.tex)
+%   Fig.~\ref{fig:sq4_change}     figures/sq4_change.png               (change per swap + within/between ratio)
+%   Fig.~\ref{fig:sq4_decomp}     figures/sq4_decomposition.png        (A/B map difference = AIF part x tissue part)
+% Appendix: figures/sq4_roi_examples.png, figures/sq4_ba_cross.png, figures/sq4_ba_grown.png, sq4_report.md tables.
+%
+% Numbers: results/combined_v1/sq4_aif_swap/sq4_report.md (QC with tail threshold 0.30, current pipeline).
+% =====================================================================
+
+% ---------------------------------------------------------------------
+% METHODS
+% ---------------------------------------------------------------------
+\subsection{Perfusion sensitivity to the AIF (SQ4)}
+\label{sec:sq4_methods}
+
+\textbf{Rationale.} SQ1 and SQ2 showed that the AIF depends on the sampled segment and on the view. Whether that
+matters depends on what it does to the perfusion maps, which are the actual output of perfDSA. In perfusion
+imaging the AIF scales and shapes every parameter: a different amplitude scales CBF and CBV, and a delay or
+dispersion between AIF and tissue biases CBF, MTT and Tmax~\cite{calamante2000,calamante2013}; in CT perfusion,
+moving the AIF changed the maps markedly~\cite{ferreira2010}. Comparing maps of different runs mixes AIF effects with
+tissue and projection effects. The AIF was therefore \emph{swapped} while the tissue curves were held fixed, so that
+every difference between two maps of the same run is caused by the AIF alone.
+
+\textbf{AIF swap.} For every run of the 68 A/B pairs the deconvolution of perfDSA was repeated on the unchanged
+tissue curves (the same uniform 250\,ms sequence, which reproduces the stored maps exactly) with five AIFs: the run's
+own \texttt{ica\_top} AIF (reference); its own \texttt{ica\_full\_model} and \texttt{ica\_full\_grown} AIF (segment
+swaps, SQ1); the \texttt{ica\_top} AIF of the other plane of the same injection (view swap, SQ2; both planes share the
+frame times, so no temporal alignment is needed); and that AIF rescaled to the peak height of the own AIF, so that only
+its shape differs (shape-only view swap). A swap was analysed only when both the reference and the donor AIF were
+trusted.
+
+\textbf{Region.} No vascular-territory atlas was available. An AIF-independent parenchymal region was defined per run
+from the tissue curves: pixels whose temporally smoothed enhancement exceeded about five times the frame noise and
+that were not part of a large vessel or of the black collimator area (minimum-intensity value $\geq$ 120 of 170).
+perfDSA sets CBV $\leq$ 0 to zero in many of these pixels; the analysis therefore used the region pixels with CBV
+$>$ 0 in the reference map, and this pixel set was kept fixed for all swaps of the run, so that differences cannot
+come from a changing pixel set. Per map the median CBV, CBF and MTT and the mean Tmax (more sensitive than the median
+to shifts smaller than the 0.25\,s frame interval) over this region were taken. A swapped map whose median CBV or
+MTT was zero (more than half of the region clipped) was counted as collapsed and left out of the log-scale
+statistics.
+
+\textbf{Analyses.} (1) Change: log ratio swapped/reference for CBV, CBF and MTT (reported as \%), difference for
+Tmax; median and IQR, Wilcoxon signed-rank test, Holm correction over the four parameters of a swap. Because the view
+swap acts in opposite directions on plane A and plane B tissue, all analyses were done per plane. (2) Agreement:
+Bland--Altman limits of agreement~\cite{bland1999}. (3) Relevance: a change matters when it is large compared with how
+much patients differ. The within-patient change (root mean square of the log ratio, which includes the bias) was
+divided by the between-patient standard deviation of the log reference value in the same plane; a ratio below 1 means
+that the AIF choice moves a patient less than patients differ from each other. (4) Rank stability: DSA perfusion
+parameters are used as patient-level biomarkers, e.g.\ MTT and Tmax were associated with functional
+outcome~\cite{vandersluijs2026}, which requires that patients keep their order. Spearman correlation between the
+reference and the swapped values over the patients was computed per plane, and between the plane A and plane B maps
+of the same injection. (5) Tmax: whether the earlier arrival of the grown AIF shifts Tmax was tested with the
+Wilcoxon test on the Tmax shift and its Spearman correlation with the arrival difference. (6) Plane difference: the
+ratio of the B and A map of one injection (each with its own AIF) was split into an AIF part (B tissue with the B-AIF
+versus B tissue with the A-AIF) and a tissue part (B tissue versus A tissue with the same A-AIF).
+
+% ---------------------------------------------------------------------
+% RESULTS
+% ---------------------------------------------------------------------
+\subsection{Perfusion sensitivity to the AIF (SQ4)}
+\label{sec:sq4_results}
+
+\textbf{Region and swaps.} The parenchymal region covered a median 46\,\% of the image; with the reference AIF a
+median of 32\,\% (IQR 21--43\,\%) of its pixels had CBV $>$ 0. Valid swaps: 44--53 per segment swap and plane, 43 per
+view swap and plane. Four of about 400 swapped maps collapsed (two view swaps on A tissue, two grown swaps).
+
+\textbf{Segment.} With the model-segmented full-ICA AIF the maps changed by 1--3\,\%
+(Table~\ref{tab:sq4}, Fig.~\ref{fig:sq4_change}); the change was small compared with the patient differences (ratio
+0.05--0.44) and the patients kept their order ($\rho \geq 0.85$). With the grown AIF the maps of plane B tissue
+changed by $+43$\,\% (CBV), $+22$\,\% (CBF) and $+15$\,\% (MTT) ($p_\mathrm{Holm} < 0.001$); in plane A the median change
+was not significant ($-8$\,\%, $-3$\,\%, $-4$\,\%) but the spread was wide (CBV IQR $-36$ to $+18$\,\%). The within/between
+ratio reached 0.9--1.5 for CBV and MTT, and the patient order of CBV was largely lost ($\rho$ = 0.39 and 0.48).
+
+\textbf{View.} Using the AIF of the other plane changed the maps most: on plane A tissue the lateral AIF lowered CBV
+by 45\,\%, CBF by 37\,\% and MTT by 19\,\%; on plane B tissue the frontal AIF raised them by 73\,\%, 61\,\% and 28\,\%
+(all $p_\mathrm{Holm} < 10^{-4}$). These changes exceeded the differences between patients (ratio 1.1--3.2 for CBV, CBF and
+MTT) and scrambled the patient order of CBV ($\rho$ = $-0.04$ and 0.27) and MTT ($\rho$ = 0.15 and 0.44). Matching the
+peak height removed most of this: the shape-only swap changed the medians by $-5$ to $+11$\,\% (CBV and MTT n.s.), the
+ratio fell to 0.37--0.49 for CBF and to about 1 for CBV and MTT, and the CBF order was restored ($\rho$ = 0.94 and 0.95),
+that of CBV only partly ($\rho$ = 0.69 and 0.41).
+
+\textbf{Tmax.} Tmax was the most robust parameter: its within/between ratio stayed below 0.45 for every swap and its
+patient order was preserved ($\rho \geq 0.78$). It did respond to timing: the grown AIF arrived 0.12\,s earlier
+(median) and shifted the mean Tmax by $+0.19$\,s (IQR $+0.10$ to $+0.32$\,s, $p < 10^{-8}$), changing Tmax in 61\,\% of the
+pixels; the shift correlated with the arrival difference ($\rho = 0.52$). The view swaps shifted Tmax by about
+$\pm$0.13\,s.
+
+\textbf{Plane A versus plane B maps.} For the same injection the lateral map had a lower CBV (B/A 0.38), CBF (0.66)
+and MTT (0.57) than the frontal map (over the fixed parenchymal region; over the perfused pixels of each map, as in
+SQ2, CBV B/A was 0.42), and the patient order agreed only for CBF and Tmax ($\rho$ = 0.79 and 0.80), not for
+CBV and MTT ($\rho$ = 0.35 and 0.35). Split into its parts (Fig.~\ref{fig:sq4_decomp}), the CBF difference came
+entirely from the AIF (AIF part 0.62, tissue part 1.05), whereas the CBV and MTT differences came from both the AIF
+(0.58 and 0.78) and the tissue (0.77 and 0.73).
+
+\input{tables/table_sq4}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/sq4_change.png}
+\caption{Effect of the AIF on the perfusion maps with the tissue curves held fixed, for plane A (left) and plane B
+(right) tissue. Top: change relative to the map with the run's own \texttt{ica\_top} AIF (median, IQR; CBV, CBF, MTT in
+\%, Tmax in 0.01\,s). Bottom: within-patient change divided by the between-patient spread; above the dashed line the AIF
+choice moves a patient more than patients differ from each other.}
+\label{fig:sq4_change}
+\end{figure*}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/sq4_decomposition.png}
+\caption{Ratio of the plane B and plane A perfusion map of the same injection (purple), split into an AIF part (B tissue
+with the B-AIF vs.\ the A-AIF, orange) and a tissue part (B vs.\ A tissue with the same A-AIF, blue); median and IQR,
+43 injections.}
+\label{fig:sq4_decomp}
+\end{figure}
+
+% ---------------------------------------------------------------------
+% DISCUSSION
+% ---------------------------------------------------------------------
+\subsection{Does the AIF variability change the maps?}
+\label{sec:sq4_discussion}
+
+\textbf{Yes, for realistic alternatives, and as much as patients differ.} Holding the tissue fixed isolates the AIF:
+any difference between two maps of the same run is caused by the AIF choice. A near-identical AIF (model-segmented
+full ICA) changes the maps by a few per cent and leaves the patient order intact, so small segmentation differences
+are harmless. A different segment (grown full ICA) or the AIF of the other view changes CBV, CBF and MTT by tens of
+per cent, by as much as or more than patients differ from each other, and reorders the patients for CBV and MTT. For a
+biomarker that is meant to separate patients, such as MTT and Tmax for functional outcome~\cite{vandersluijs2026}, the
+AIF choice is therefore not a detail: it can change which patients appear abnormal.
+
+\textbf{How: mostly amplitude, partly shape and timing.} The deconvolution makes CBF and CBV inversely proportional to
+the AIF amplitude, and the view swap mainly changes the amplitude (SQ2: the lateral AIF is about a third higher because
+of the exposure). Matching the peak height removed the systematic part of the view effect and restored the CBF order,
+which confirms that amplitude is the main path. What remains after matching, a per-patient spread in CBV and MTT
+comparable to the patient differences, is due to the shape of the curve: CBV depends on the AIF area and MTT on its
+width, and these differ between views even at equal peak height. Timing acts on Tmax: the grown AIF, sampled upstream,
+arrives about 0.12\,s earlier and shifts Tmax by about 0.19\,s, the delay effect described for MR and CT
+perfusion~\cite{calamante2000}. Because the frame interval is 0.25\,s, this shift is close to one frame and changes the
+Tmax of most pixels by one step, yet it is small compared with the patient differences, so Tmax ranks are preserved.
+
+\textbf{What this adds to SQ2.} The CBF of the lateral and frontal map of one injection differs entirely because of
+the AIF: with the same AIF the two views give the same CBF (tissue part 1.05). For CBV and MTT a tissue part remains:
+with the same AIF the lateral tissue still yields about a quarter lower CBV and MTT. The view difference in CBV and MTT is
+therefore not only an AIF problem; it also reflects how the parenchyma is projected, which is consistent with the lower
+tissue signal found in SQ2.
+
+\textbf{Limitations.} (i) The region is the whole enhancing parenchyma of a view, not a vascular territory, and
+includes contralateral parenchyma in runs with cross-filling. (ii) perfDSA sets CBV $\leq$ 0 to zero in about two thirds
+of the enhancing pixels; the medians describe the remaining third, which is fixed per run but is itself defined by the
+reference AIF. (iii) Tmax is quantised at 0.25\,s; the region mean is used to detect smaller shifts. (iv) There is no
+reference standard: the swaps show how much the maps depend on the AIF, not which AIF gives the correct map. (v)
+Between-patient spread is estimated from 43--54 runs per plane and includes residual measurement noise, so the ratio is
+a conservative comparison. (vi) QC used the tail threshold of 0.30. (vii) The decomposition uses medians over regions
+that differ between the views, so the parts are approximate (their product is not exactly the total).
+
+\textbf{Recommendation.} The AIF should be defined in one fixed way, sampled from the supraclinoid ICA as perfDSA
+does, and taken from the same view whenever patients or time points are compared, because maps made with another
+segment or view are not comparable. Small differences in the outline of the supraclinoid mask are harmless, so quality
+control is better spent on excluding wrong masks and on checking vessel overlap and exposure than on refining the
+segmentation. When perfusion has to be compared across acquisitions, Tmax and CBF are the most reliable parameters:
+Tmax does not depend on the AIF amplitude, and CBF agrees between views once the AIF amplitude is matched, whereas CBV and
+MTT remain sensitive to the shape of the AIF and to the projection. Where absolute values cannot be standardised, relative
+parameters within one map, normalised to a reference region as is common in CT and MR
+perfusion~\cite{copen2014,delarosa2023}, remove a common AIF factor altogether.
+
+\textbf{Conclusion.} The variability of the AIF changes the perfusion maps. A practically identical AIF changes them by a
+few per cent, but a different ICA segment or the AIF of the other view changes CBV, CBF and MTT by tens of per cent, as
+much as or more than patients differ from each other, and changes the order of the patients for CBV and MTT. The amplitude
+of the AIF is the main cause; its shape adds patient-specific error in CBV and MTT, and its timing shifts Tmax. Tmax is the
+most robust parameter. The AIF choice is therefore part of the measurement and must be fixed and reported for DSA
+perfusion values to be interpretable.

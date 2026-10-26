@@ -1,0 +1,10 @@
+{
+  "_comment": "Thresholds of scripts/aif_feature_set.py. Fractions are of the baseline-corrected AIF peak. arrival_frac is chosen in aif_features/arrival_threshold.csv (the smallest fraction above the 3-sigma baseline noise of every trusted curve); change it here, not in the code.",
+  "arrival_frac": 0.15,
+  "arrival_frac_candidates": [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5],
+  "peak_prominence": 0.1,
+  "tail_threshold": 0.3,
+  "late_rise_threshold": 0.15,
+  "first_pass_end_frac": 0.1,
+  "shape_grid_s": [-2.0, 12.0, 0.25]
+}
