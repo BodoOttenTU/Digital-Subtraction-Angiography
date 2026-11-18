@@ -1,26 +1,6 @@
-"""
-Describe the dataset of a combined-cohort result (e.g. results/combined_v1) for the report: what kind of data
-it is, how many patients / injections / runs / planes, how the runs were acquired, and how many survive each
-selection and QC step. Everything is computed from the result tables plus one DICOM header per patient, so it
-can be regenerated after any change.
+"""Cohort description for the report: counts, acquisition parameters, flowchart, cohort tables.
 
-Input (in <out>):
-    acquisition_table.csv   postprocess_combined.py (one row per run, DICOM header fields)
-    selection.csv           select_runs.py (included, evt_phase)
-    aif_qc/usable_aifs.csv  aif_qc.py (AIF usable per variant)  -- optional, QC rows are skipped without it
-    the DICOMs the acquisition table points to (one header per patient, for age/sex/weight/height/procedure;
-    cached in data_summary/demographics.csv, delete it or pass --rescan to re-read)
-    ../PRAISE_BATCH_2/PRAISE.json (patients listed by Melbourne with their perfusion-evaluation run)
-
-Output (in <out>/data_summary/):
-    data_summary.md         setup of the data runs, cohort description, tables, flowchart numbers
-    table_cohort.tex        Table I: cohort and acquisition characteristics (booktabs, per batch + total)
-    table_planes.tex        acquisition geometry/exposure per plane (A = frontal, B = lateral)
-    flowchart.png / .pdf    patients -> runs -> included -> usable AIF
-    demographics.csv        per patient: age, sex, weight, height, procedure, system (de-identified IDs)
-
-Example:
-    python scripts/data_summary.py results/combined_v1
+    python scripts/data_summary.py
 """
 
 import argparse
@@ -32,15 +12,13 @@ import pandas as pd
 from matplotlib import pyplot as plt
 
 from cohort_common import ROOT, parse_source, rd
+from paths import DATA
 
 BATCHES = {"PRAISE": "Batch 1", "PRAISE_BATCH_2": "Batch 2"}
 HEADER_KEYS = ["PatientAge", "PatientSex", "PatientWeight", "PatientSize", "StudyDescription", "StationName",
                "PatientIdentityRemoved", "DeidentificationMethod"]
 
 
-# ----------------------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------------------
 def med_iqr(s, fmt="{:.0f}"):
     s = pd.Series(s, dtype=float).dropna()
     if s.empty:
@@ -49,21 +27,10 @@ def med_iqr(s, fmt="{:.0f}"):
     return f"{fmt.format(m)} [{fmt.format(q1)}–{fmt.format(q3)}]"
 
 
-def med_range(s, fmt="{:.0f}"):
-    s = pd.Series(s, dtype=float).dropna()
-    return f"{fmt.format(s.median())} ({fmt.format(s.min())}–{fmt.format(s.max())})" if len(s) else "–"
-
-
 def n_pct(mask, total=None):
     mask = pd.Series(mask).astype(bool)
     total = len(mask) if total is None else total
     return f"{int(mask.sum())} ({100 * mask.sum() / total:.0f}%)" if total else "0"
-
-
-def md_table(df):
-    rows = ["| " + " | ".join(map(str, df.columns)) + " |", "|" + "---|" * len(df.columns)]
-    rows += ["| " + " | ".join(str(v).replace("\n", " ") for v in r) + " |" for r in df.itertuples(index=False)]
-    return rows
 
 
 def tex_escape(s):
@@ -88,9 +55,6 @@ def tex_table(df, caption, label, colspec=None):
     return "\n".join(L)
 
 
-# ----------------------------------------------------------------------------
-# Data
-# ----------------------------------------------------------------------------
 def demographics(acq, cache, rescan):
     if cache.exists() and not rescan:
         return pd.read_csv(cache, dtype={"patient_id": str})
@@ -125,9 +89,6 @@ def injection_level(acq, sel):
     return inj
 
 
-# ----------------------------------------------------------------------------
-# Tables
-# ----------------------------------------------------------------------------
 def cohort_table(dem, acq, inj):
     groups = [(BATCHES[d], d) for d in BATCHES if d in set(acq.dataset)] + [("Total", None)]
     rows = []
@@ -223,119 +184,29 @@ def plot_flow(steps, path):
         if i < n - 1:
             ax.annotate("", xy=(0.30, y - 0.68 / n), xytext=(0.30, y - 0.32 / n), xycoords="axes fraction",
                         arrowprops=dict(arrowstyle="->", color="#4a5d73", lw=0.8))
-        if excl:  # excluded on the arrow into this step
+        if excl:
             ax.annotate("", xy=(0.64, y + 0.5 / n), xytext=(0.30, y + 0.5 / n), xycoords="axes fraction",
                         arrowprops=dict(arrowstyle="->", color="#9aa5b1", lw=0.6))
             ax.text(0.80, y + 0.5 / n, excl, ha="center", va="center", fontsize=7.5, transform=ax.transAxes,
                     bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="#9aa5b1", lw=0.6))
     fig.tight_layout()
     fig.savefig(path.with_suffix(".png"), dpi=200)
-    fig.savefig(path.with_suffix(".pdf"))
     plt.close(fig)
-
-
-# ----------------------------------------------------------------------------
-# Report
-# ----------------------------------------------------------------------------
-def write_md(out, dst, dem, acq, inj, cohort, planes, steps, paired, praise):
-    pat_planes = acq.groupby("ab_pair_id").plane.agg(lambda p: "".join(sorted(p)))
-    proc = dem.procedure.map(procedure_class).value_counts()
-    patt = acq.frame_interval_pattern.value_counts()
-    L = [f"# Dataset summary — {out.name}", "",
-         "Generated by `scripts/data_summary.py`; re-run instead of editing. Patient IDs are the de-identified "
-         "PRAISE IDs.", "",
-         "```bash", "conda activate BEP", "cd perfDSA-master", f"python scripts/data_summary.py results/{out.name}",
-         "```", "",
-         "## What kind of data", "",
-         f"- **Clinical population: acute ischaemic stroke patients treated with endovascular thrombectomy (EVT).** "
-         f"No healthy controls. The DICOM study description is *ANGIO Neck Clot Retrieval* for "
-         f"{proc.get('clot retrieval (EVT)', 0)} patients and *ANGIO Cerebral DSA* for "
-         f"{proc.get('cerebral DSA', 0)} (the generic code for a neuro-interventional session). The series "
-         f"descriptions place {int((inj.evt_phase != 'unlabeled').sum())} of {len(inj)} injections during or "
-         f"after the procedure (\"POST 1ST PASS\", \"POST 5TH PASS\", \"FINAL\", \"POST STENT/PLASTY\", "
-         f"\"POST VERAPAMIL\"); the other {int((inj.evt_phase == 'unlabeled').sum())} only name the vessel "
-         f"(e.g. \"LEFT ICA\"), so their moment in the procedure is not recorded.",
-         "- **Source:** PRAISE study, de-identified by the University of Melbourne "
-         f"(DICOM `PatientIdentityRemoved = YES`, {dem.deidentified_by.nunique()} de-identification source). "
-         f"Received as two batches (batch 1: {acq[acq.dataset == 'PRAISE'].patient_id.nunique()} patients, "
-         f"batch 2: {acq[acq.dataset == 'PRAISE_BATCH_2'].patient_id.nunique()}); `PRAISE.json` lists "
-         f"{len(praise)} patients with the run chosen for perfusion evaluation (`DSA_perf_eval`).",
-         f"- **One injection per patient**: exactly the perfusion-evaluation run, acquired **biplane**: every "
-         f"injection has a plane A (frontal/AP, primary angle ~0°) and a plane B (lateral, ~−90°) run of the "
-         f"same contrast bolus ({int((pat_planes == 'AB').sum())} of {len(pat_planes)} injections are complete "
-         f"A+B pairs). No pre-EVT (baseline) runs: the timing is after one or more passes or the final run.",
-         f"- **System:** Siemens AXIOM-Artis biplane, {dem.system.nunique()} rooms "
-         + " / ".join(f"{k}: {v} patients" for k, v in dem.system.value_counts().items())
-         + f"; studies {pd.to_datetime(acq.study_date.astype(str)).min():%b %Y}–"
-           f"{pd.to_datetime(acq.study_date.astype(str)).max():%b %Y}.",
-         f"- **Images:** vendor-subtracted DSA (stored as subtracted, display LUT applied), "
-         f"{int(acq.rows.iloc[0])}×{int(acq["columns"].iloc[0])} px, {int(acq.bits_stored.iloc[0])} bit, iodine contrast. "
-         f"Contrast volume and injection rate are **not** in the headers.",
-         f"- **Variable frame rate in every run**: 4 fps for the first 11 intervals (2.75 s), then 2 fps, and in "
-         f"{(acq.frame_rate_regime == '4-2-1 fps').sum()} of {len(acq)} runs 1 fps at the end "
-         f"({patt.index[0]} is the most common pattern). Runs last {med_iqr(acq.duration_s, '{:.2f}')} s "
-         f"(median [IQR]), {med_iqr(acq.n_frames)} frames.", "",
-         "## How the data runs are set up", "",
-         "Each step writes into `results/<name>/` and the next step reads its tables:", "",
-         "1. `run_dataset.py -i ../PRAISE ../PRAISE_BATCH_2 -o results/combined_v1/raw_model --ica-full model "
-         "--save-maps` and the same with `--ica-full grown` into `raw_grown`. Every multi-frame DICOM (also inside "
-         "the .tar archives) is one **run**. Per run: read header → resample to a uniform 250 ms grid → ICA-top "
-         "U-Net mask → AIF = mean of the mask over time → deconvolution → CBV/CBF/MTT/Tmax. The ICA-top AIF is "
-         "computed in both raw runs (identical masks in all runs).",
-         "2. `scripts/postprocess_combined.py results/combined_v1` merges both into **three AIF variants** "
-         "(`ica_top`, `ica_full_model`, `ica_full_grown`), adds plane, injection site, A/B pairing, frame-rate "
-         "pattern and duplicate detection (`acquisition_table.csv`), the native-timing AIFs (`aif_curves.csv`), "
-         "per-run bundles (`npz/`) and `dataset_report.md`.",
-         "3. `scripts/mask_overlap.py` adds the Dice/AIF correlation between the three masks.",
-         "4. `scripts/select_runs.py` labels the EVT phase and picks one plane per patient for the patient-level "
-         "analysis (ICA injection, not a duplicate; the plane with the least venous overlap in the ICA-top mask) "
-         "→ `selection.csv`.",
-         "5. `scripts/build_features.py` → `features*.csv` (AIF curve features per run × variant, paired A/B and "
-         "full-vs-top tables).",
-         "6. `scripts/aif_qc.py` → `aif_qc/` (AIF failure categories and `usable_aifs.csv`).",
-         "7. `scripts/data_summary.py` (this summary) and `scripts/build_viewer.py` (interactive viewer).", "",
-         "Units of analysis: **patient** (68) = **injection** (1 per patient) → **run** (plane A, plane B) → "
-         "**AIF curve** (3 mask variants per run). A/B runs of one injection share the bolus, so A vs B is a "
-         "paired comparison; the three variants of one run share the frames, so full vs top is paired as well.", "",
-         "## Table I — cohort and acquisition", "", *md_table(cohort), "",
-         "Age and sex from the de-identified DICOM header (`PatientAge`, `PatientSex`); weight only where the "
-         "header has it. Injection site and EVT phase parsed from the series description; *unknown* = the "
-         "description has no vessel (e.g. \"FINAL\", \"POST 1ST PASS\"). Values: median [IQR] or n (%).", "",
-         "## Acquisition per plane", "", *md_table(planes), "",
-         "## Flowchart (patients → analysed runs)", "", "![flowchart](flowchart.png)", "",
-         *md_table(pd.DataFrame(steps, columns=["step", "remaining", "excluded"])), ""]
-    if paired:
-        L += ["Paired sets (ICA injections with a usable AIF in **both** planes, for A vs B):", "",
-              *md_table(pd.DataFrame([(k, v) for k, v in paired.items()], columns=["set", "injections"])), ""]
-    L += ["## Notes for the Methods section", "",
-          "- Name the population precisely: AIS patients undergoing EVT, intra-/post-procedural control runs, "
-          "not diagnostic or healthy-volunteer DSA. Perfusion may be partly restored, and the injected side is normally the "
-          "treated side (not recorded explicitly).",
-          "- Biplane gives two simultaneous projections of the **same** bolus; the header time resolution is 1 s, "
-          "so the A/B offset is only known to < ~1 s (bolus arrival differs by a median 68 ms, see "
-          "`dataset_report.md`).",
-          "- CCA injections fill the ECA as well (overlap over the ICA); they are kept in the run-level tables "
-          "but excluded from the patient-level selection.",
-          "- Missing per-patient data: contrast volume/rate, occlusion site, NIHSS, eTICI and outcome are not in "
-          "the DICOMs; ask the PRAISE team if the report needs them.",
-          "- Table files for LaTeX: `table_cohort.tex`, `table_planes.tex` (need `booktabs`; both are already "
-          "loaded in `report/main.tex`), figure `flowchart.pdf`.", ""]
-    (dst / "data_summary.md").write_text("\n".join(L), encoding="utf-8")
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("out", type=Path, help="combined result folder, e.g. results/combined_v1")
+    p.add_argument("out", type=Path, nargs="?", default=DATA, help="data folder")
     p.add_argument("--praise-json", type=Path, default=ROOT.parent / "PRAISE_BATCH_2" / "PRAISE.json")
     p.add_argument("--rescan", action="store_true", help="re-read the DICOM headers for the demographics")
     args = p.parse_args()
 
-    dst = args.out / "data_summary"
+    dst = args.out / "cohort"
     dst.mkdir(exist_ok=True)
     acq_all = pd.read_csv(args.out / "acquisition_table.csv")
     acq = acq_all[~acq_all.is_duplicate].copy()
     sel = pd.read_csv(args.out / "selection.csv")
-    qc = args.out / "aif_qc" / "usable_aifs.csv"
+    qc = args.out / "qc" / "usable_aifs.csv"
     use = pd.read_csv(qc) if qc.exists() else None
     praise = json.loads(args.praise_json.read_text())
 
@@ -353,7 +224,6 @@ def main():
         planes, "Acquisition geometry and exposure per plane (all unique runs). Median [IQR].", "tab:planes"),
         encoding="utf-8")
     plot_flow(steps, dst / "flowchart")
-    write_md(args.out, dst, dem, acq, inj, cohort, planes, steps, paired, praise)
     print(cohort.to_string(index=False))
     print()
     for s in steps:

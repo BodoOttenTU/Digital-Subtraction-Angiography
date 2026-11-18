@@ -1,8 +1,4 @@
-"""
-Shared helpers for the combined-cohort post-processing (mask_overlap.py, postprocess_combined.py,
-build_viewer.py). Reuses run_dataset.py as a module, so the DICOM loading and preprocessing are
-exactly the ones the perfusion run used.
-"""
+"""Helpers shared by the combined-cohort scripts; reuses run_dataset.py for DICOM loading."""
 
 import os
 import sys
@@ -10,7 +6,7 @@ from pathlib import Path
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
-ROOT = Path(__file__).resolve().parents[1]  # perfDSA-master
+ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import cv2 as cv  # noqa: E402
@@ -19,7 +15,6 @@ import pandas as pd  # noqa: E402
 
 import run_dataset as rd  # noqa: E402
 
-VARIANTS = ("ica_top", "ica_full")
 MAP_KEYS = ("CBV", "CBF", "MTT", "Tmax")
 
 

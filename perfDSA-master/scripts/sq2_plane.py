@@ -1,51 +1,6 @@
-"""
-SQ2 — effect of the projection view: plane A (frontal) versus plane B (lateral) of the same injection.
+"""SQ2: plane A (frontal) vs plane B (lateral) of the same injection.
 
-Both planes of a biplane run record the same bolus with the same frame times (identical FrameTimeVector), so
-an A/B pair differs only in the projection: geometry, exposure (automatic exposure control), what overlaps the
-AIF mask, and the segmentation in that view. Primary variant: ica_top (the perfDSA AIF, SQ1 recommendation);
-ica_full_model and ica_full_grown are reported for completeness.
-
-Pairs
-    One pair per injection and variant, both planes trusted (aif_taxonomy.py). Each patient contributes at most
-    one injection to the ica_top pairs, so the pairs are independent.
-
-1. Paired tests per feature (B vs A)
-    Same features and scales as SQ1 (sq1_full_vs_top.FEATURES): difference B - A for times and dimensionless
-    shape features, log ratio B/A for amplitudes and perfusion parameters. Shapiro-Wilk decides paired t vs
-    Wilcoxon signed-rank; Holm over the features of one variant.
-2. Bland-Altman B vs A per feature (bias, 95 % LoA; log scale for ratio features; non-parametric limits too).
-3. Why is the peak higher in B? (ica_top) Three candidate explanations, each with a testable prediction:
-    exposure      lower kVp in B raises the iodine contrast of the whole image -> the AIF peak ratio B/A
-                  equals the whole-image contrast ratio B/A, i.e. AIF / whole-image contrast B/A = 1
-    path length   the ray through the siphon is longer in one view (foreshortening) -> a residual in AIF /
-                  whole-image contrast, related to the projected length of the segment (mask px ratio B/A;
-                  a foreshortened segment projects onto fewer pixels with a longer path per pixel)
-    saturation    clipping of the densest pixels -> can only LOWER the measured peak; pairs with saturated
-                  mask pixels should have a lower, not higher, peak ratio
-    plus overlap  vessels projected over the mask add iodine -> relation with ring vessel fraction B - A
-    Tested with Spearman correlations of log(peak B/A) and log(AIF / whole-image B/A) with log(whole-image
-    B/A), kVp B - A, log(mask px B/A), ring vessel fraction B - A and saturated fraction B - A, and by
-    comparing pairs with and without saturation (Mann-Whitney).
-4. Does normalisation remove the plane bias?
-    a) feature level: bias and LoA of the shape-only features (peak- or AUC-normalised) versus those of the
-       amplitude features;
-    b) curve level: arrival-aligned curves (aif_features/curves_shape.csv), RMSE between plane A and B in units
-       of the (mean) peak, -1 to 8 s after arrival: raw (common scale), peak-normalised, AUC-normalised;
-       paired Wilcoxon raw vs normalised.
-    c) perfusion: deconvolution divides tissue by AIF, so a scaling common to AIF and tissue cancels; CBV, CBF
-       and MTT B/A test whether the plane bias reaches the perfusion maps.
-5. Sensitivity (ica_top): ICA injections only (no ECA overlap from CCA injections); pairs without saturated
-   mask pixels in either plane.
-
-Input : <out>/aif_features/features_aif.csv, curves_shape.csv, aif_qc/taxonomy/taxonomy_labels.csv,
-        plane_difference/plane_runs.csv, features.csv (r_ab)
-Output: <out>/sq2_plane/  sq2_pairs.csv, sq2_tests.csv, sq2_mechanism.csv, sq2_saturation.csv,
-        sq2_curve_rmse.csv, sq2_sensitivity.csv, table_sq2.tex, forest.png, ba_<variant>.png,
-        qq_<variant>.png, mechanism.png, shape_curves.png, sq2_report.md
-
-Example:
-    python scripts/sq2_plane.py results/combined_v1
+    python scripts/sq2_plane.py
 """
 
 import argparse
@@ -58,20 +13,17 @@ from matplotlib import pyplot as plt
 from scipy import stats
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from sq1_full_vs_top import FEATURES, fmt_effect, fmt_p, holm, md_table  # noqa: E402
+from sq1_full_vs_top import FEATURES, fmt_effect, fmt_p, holm  # noqa: E402
+from paths import DATA, PLANE, SQ2
 
 VARIANTS = ["ica_top", "ica_full_model", "ica_full_grown"]
 ALPHA = 0.05
 SHAPE_ONLY = ["aif_fwhm_s", "aif_rise_s", "aif_auc_norm_s", "aif_sd_s", "aif_skewness", "aif_tail_frac"]
-AMPLITUDE = ["aif_peak", "aif_auc_first_pass"]
 CURVE_WINDOW = (-1.0, 8.0)  # s after arrival
 PLANE_COL = {"A": "#2a78d6", "B": "#eb6834"}
 VAR_COL = {"ica_top": "#2a78d6", "ica_full_model": "#7a7a7a", "ica_full_grown": "#2f9e44"}
 
 
-# ----------------------------------------------------------------------------
-# Pairs
-# ----------------------------------------------------------------------------
 def make_pairs(feat, extra):
     """One row per injection x variant, both planes trusted; d_<f> = B - A (or log B/A)."""
     f = feat.merge(extra, on=["run_id", "variant"], how="left")
@@ -99,9 +51,6 @@ def make_pairs(feat, extra):
     return pd.DataFrame(rows)
 
 
-# ----------------------------------------------------------------------------
-# 1-2. Tests and Bland-Altman
-# ----------------------------------------------------------------------------
 def tests(pairs, label=""):
     rows = []
     for v in VARIANTS:
@@ -132,9 +81,6 @@ def tests(pairs, label=""):
     return t
 
 
-# ----------------------------------------------------------------------------
-# 3. Mechanism of the higher peak in B
-# ----------------------------------------------------------------------------
 def mechanism(pairs):
     p = pairs[pairs.variant == "ica_top"]
     rows = []
@@ -162,9 +108,6 @@ def saturation_check(pairs):
     return pd.DataFrame(rows), (mw.pvalue if mw else np.nan)
 
 
-# ----------------------------------------------------------------------------
-# 4. Shape-only agreement at curve level
-# ----------------------------------------------------------------------------
 def curve_rmse(pairs, curves, feat):
     """Per ica_top pair: RMSE between the A and B curve, arrival-aligned, in units of the mean peak."""
     f = feat.set_index(["run_id", "variant"])
@@ -188,9 +131,6 @@ def curve_rmse(pairs, curves, feat):
     return pd.DataFrame(rows)
 
 
-# ----------------------------------------------------------------------------
-# Figures
-# ----------------------------------------------------------------------------
 def plot_forest(t, path):
     feats = list(FEATURES)
     y = np.arange(len(feats))[::-1]
@@ -247,28 +187,6 @@ def plot_ba(pairs, t, variant, path):
     plt.close(fig)
 
 
-def plot_qq(pairs, variant, path):
-    feats = list(FEATURES)
-    ncol = 5
-    nrow = int(np.ceil(len(feats) / ncol))
-    fig, axes = plt.subplots(nrow, ncol, figsize=(3.2 * ncol, 3 * nrow), squeeze=False)
-    p = pairs[pairs.variant == variant]
-    for ax, c in zip(axes.flat, feats):
-        d = p[f"d_{c}"].dropna()
-        if len(d) >= 3:
-            (osm, osr), (slope, icpt, _) = stats.probplot(d, dist="norm")
-            ax.scatter(osm, osr, s=8, color="k")
-            ax.plot(osm, slope * osm + icpt, color="C3", lw=0.8)
-        ax.set_title(FEATURES[c][0], fontsize=9)
-        ax.tick_params(labelsize=7)
-    for ax in axes.flat[len(feats):]:
-        ax.axis("off")
-    fig.suptitle(f"Q-Q plots of the paired differences B - A, {variant}")
-    fig.tight_layout()
-    fig.savefig(path, dpi=90)
-    plt.close(fig)
-
-
 def plot_mechanism(pairs, path):
     p = pairs[pairs.variant == "ica_top"]
     ticks = [0.5, 0.75, 1, 1.5, 2, 3]
@@ -320,9 +238,6 @@ def plot_shape_curves(pairs, curves, feat, path):
     plt.close(fig)
 
 
-# ----------------------------------------------------------------------------
-# Table and report
-# ----------------------------------------------------------------------------
 TABLE_FEATURES = ["aif_arrival_s", "aif_ttp_s", "aif_peak", "aif_auc_first_pass", "aif_fwhm_s", "aif_rise_s",
                   "aif_auc_norm_s", "aif_sd_s", "aif_tail_frac", "CBV_median", "CBF_median", "MTT_median", "Tmax_median"]
 
@@ -353,106 +268,19 @@ def tex_table(t, n, path):
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def write_report(out_dir, pairs, t, mech, sat, sat_p, rmse, sens, command):
-    n = pairs.groupby("variant").size().reindex(VARIANTS)
-    nn = t.groupby("variant").normal.agg(["sum", "size"]).reindex(VARIANTS)
-    tt = t.assign(shapiro_p=t.shapiro_p.map(fmt_p), p_t=t.p_t.map(fmt_p), p_wilcoxon=t.p_wilcoxon.map(fmt_p),
-                  p_holm=t.p_holm.map(fmt_p))
-    ba = t.copy()
-    for col in ["ba_bias", "ba_loa_low", "ba_loa_high", "np_loa_low", "np_loa_high"]:
-        ba[col] = [fmt_effect(v, s) for v, s in zip(ba[col], ba.scale)]
-    dis = t[t.p_wilcoxon.notna() & ((t.p_t < ALPHA) != (t.p_wilcoxon < ALPHA))]
-    top = pairs[pairs.variant == "ica_top"]
-    r_ab = pairs.groupby("variant").r_ab.median().reindex(VARIANTS).round(3)
-    shape = t[(t.variant == "ica_top") & t.feature.isin(SHAPE_ONLY + AMPLITUDE)]
-    rm = rmse[["rmse_raw", "rmse_peak_norm", "rmse_auc_norm"]].describe(percentiles=[0.25, 0.5, 0.75]).round(3)
-    w_peak = stats.wilcoxon(rmse.rmse_raw, rmse.rmse_peak_norm)
-    w_auc = stats.wilcoxon(rmse.rmse_raw, rmse.rmse_auc_norm)
-    ctx = pd.DataFrame({
-        "quantity": ["kVp", "whole-image contrast peak", "mask px", "ring vessel fraction", "venous fraction",
-                     "saturated mask pixels (curves)", "frame SNR"],
-        "A": [top.kvp_A.median(), round(top.global_peak_A.median()), top.mask_px_geo_A.median(),
-              round(top.ring_vessel_frac_A.median(), 3), round(top.venous_frac_A.median(), 3),
-              int((top.sat_frac_A > 0).sum()), round(top.snr_A.median(), 1)],
-        "B": [top.kvp_B.median(), round(top.global_peak_B.median()), top.mask_px_geo_B.median(),
-              round(top.ring_vessel_frac_B.median(), 3), round(top.venous_frac_B.median(), 3),
-              int((top.sat_frac_B > 0).sum()), round(top.snr_B.median(), 1)]})
-    txt = f"""# SQ2 — plane A (frontal) vs plane B (lateral) ({out_dir.parent.name})
-
-Generated by `scripts/sq2_plane.py`; do not edit by hand, re-run instead.
-
-```bash
-{command}
-```
-
-Pairs (same injection, both planes trusted): {", ".join(f"{v} {int(k)}" for v, k in n.items())}.
-Each patient contributes at most one injection ({top.patient_id.nunique()} patients for {len(top)} ica_top pairs).
-Median temporal correlation of the A and B curve (r_ab): {", ".join(f"{v} {x}" for v, x in r_ab.items())}.
-
-Context per plane (ica_top pairs, medians):
-
-{md_table(ctx)}
-
-## 1. Paired tests B vs A (Holm per variant)
-
-Normality (Shapiro-Wilk p >= 0.05) per variant: {", ".join(f"{v} {int(r['sum'])}/{int(r['size'])}" for v, r in nn.iterrows())}.
-Paired t and Wilcoxon disagree on p < 0.05 (uncorrected) in {len(dis)} of {len(t)} tests
-{"(" + ", ".join(f"{r.variant} {r.label}" for r in dis.itertuples()) + ")" if len(dis) else ""}.
-LaTeX (ica_top): `table_sq2.tex`; forest plot (all variants): `forest.png`.
-
-{md_table(tt[["variant", "label", "n", "shapiro_p", "test", "effect", "p_t", "p_wilcoxon", "p_holm"]])}
-
-## 2. Bland-Altman B vs A
-
-`ba_<variant>.png`; ratio features in %.
-
-{md_table(ba[["variant", "label", "normal", "ba_bias", "ba_loa_low", "ba_loa_high", "np_loa_low", "np_loa_high"]])}
-
-## 3. Why is the peak higher in plane B? (ica_top)
-
-Spearman over the pairs (`mechanism.png`):
-
-{md_table(mech.assign(rho=mech.rho.round(2), p=mech.p.map(fmt_p)))}
-
-Saturation (the AIF peak can only be lowered by clipping):
-
-{md_table(sat)}
-
-Mann-Whitney on log peak B/A between the two groups: p = {fmt_p(sat_p)}.
-
-## 4. Does normalisation remove the plane bias? (ica_top)
-
-Feature level, amplitude vs shape-only features:
-
-{md_table(shape.assign(p_holm=shape.p_holm.map(fmt_p))[["label", "scale", "effect", "ba_bias", "ba_loa_low", "ba_loa_high", "p_holm"]].round(3))}
-
-Curve level: RMSE between the A and B curve, arrival-aligned, {CURVE_WINDOW[0]} to {CURVE_WINDOW[1]} s after arrival,
-in units of the mean peak (`sq2_curve_rmse.csv`, `shape_curves.png`):
-
-{md_table(rm.reset_index())}
-
-Paired Wilcoxon raw vs peak-normalised: p = {fmt_p(w_peak.pvalue)}; raw vs AUC-normalised: p = {fmt_p(w_auc.pvalue)}.
-
-## 5. Sensitivity (ica_top)
-
-{md_table(sens)}
-"""
-    (out_dir / "sq2_report.md").write_text(txt, encoding="utf-8")
-
-
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("out", type=Path, help="combined result folder, e.g. results/combined_v1")
+    p.add_argument("out", type=Path, nargs="?", default=DATA, help="data folder")
     args = p.parse_args()
     out = args.out
-    out_dir = out / "sq2_plane"
+    out_dir = SQ2
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    feat = pd.read_csv(out / "aif_features" / "features_aif.csv")
-    curves = pd.read_csv(out / "aif_features" / "curves_shape.csv")
-    tax = pd.read_csv(out / "aif_qc" / "taxonomy" / "taxonomy_labels.csv")[
+    feat = pd.read_csv(out / "features" / "features_aif.csv")
+    curves = pd.read_csv(out / "features" / "curves_shape.csv")
+    tax = pd.read_csv(out / "qc" / "taxonomy" / "taxonomy_labels.csv")[
         ["run_id", "variant", "sat_frac", "venous_frac", "snr", "mask_px"]].rename(columns={"mask_px": "mask_px_geo"})
-    pr = pd.read_csv(out / "plane_difference" / "plane_runs.csv")[["run_id", "variant", "ring_vessel_frac", "global_peak"]]
+    pr = pd.read_csv(PLANE / "plane_runs.csv")[["run_id", "variant", "ring_vessel_frac", "global_peak"]]
     rab = pd.read_csv(out / "features.csv")[["run_id", "variant", "r_ab"]]
     extra = tax.merge(pr, on=["run_id", "variant"]).merge(rab, on=["run_id", "variant"])
 
@@ -483,13 +311,10 @@ def main():
     sens.to_csv(out_dir / "sq2_sensitivity.csv", index=False)
 
     plot_forest(t, out_dir / "forest.png")
-    for v in VARIANTS:
-        plot_ba(pairs, t, v, out_dir / f"ba_{v}.png")
-        plot_qq(pairs, v, out_dir / f"qq_{v}.png")
+    plot_ba(pairs, t, "ica_top", out_dir / "ba_ica_top.png")
     plot_mechanism(pairs, out_dir / "mechanism.png")
     plot_shape_curves(pairs, curves, feat, out_dir / "shape_curves.png")
     tex_table(t, int((pairs.variant == "ica_top").sum()), out_dir / "table_sq2.tex")
-    write_report(out_dir, pairs, t, mech, sat, sat_p, rmse, sens, " ".join(["python"] + sys.argv))
     print(pairs.groupby("variant").size())
     print(t[t.variant == "ica_top"][["label", "test", "effect", "p_holm"]].to_string())
     print(mech.round(3).to_string())

@@ -80,3 +80,7 @@ Thumbs.db
 desktop.ini
 .DS_Store
 ~$*
+
+# Local-only: archived code/outputs and report drafts
+/perfDSA-master/_archive/
+/perfDSA-master/report/

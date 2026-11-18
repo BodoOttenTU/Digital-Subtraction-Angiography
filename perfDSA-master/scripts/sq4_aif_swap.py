@@ -1,47 +1,6 @@
-"""
-SQ4 — does the AIF variability change the perfusion maps? AIF swap with the tissue curves held fixed.
+"""SQ4: perfusion maps recomputed with swapped AIFs while the tissue curves stay fixed.
 
-For every run (tissue = its own DSA frames, unchanged) the perfDSA deconvolution is repeated with different AIFs:
-    ref         own ica_top AIF (the perfDSA default; reference)
-    model       own ica_full_model AIF                     } segment (SQ1)
-    grown       own ica_full_grown AIF                     }
-    cross       ica_top AIF of the other plane of the same injection (identical frame times)  } view (SQ2)
-    cross_peak  the same, rescaled to the peak height of the own ica_top AIF: only its shape } differs
-Because only the AIF changes, every difference in the maps is caused by the AIF. Maps are recomputed with the
-unchanged pipeline (run_dataset.load_uniform_sequence, DSASequence), which reproduces the stored maps exactly.
-
-ROI (fixed per run, the same for every AIF of that run)
-    Enhancing parenchyma: pixels whose 3-frame-smoothed enhancement (max of 1 - frame/170, minus the median of the
-    first two frames) is >= ROI_ENH (~5x the frame noise) and whose MINIP is >= VESSEL_LEVEL (no large vessels or
-    black collimator/padding), cleaned with a binary opening. perfDSA sets CBV <= 0 to 0 in a large part of these
-    pixels (reported as roi_cbv_pos_frac), so the analysis region is the ROI pixels with CBV > 0 in the reference
-    map; this region is then kept fixed for every swap of the run, so differences cannot come from a changing pixel
-    set. No vascular-territory atlas is available, so the ROI is the whole enhancing region of the view.
-
-Per run x swap: median CBV, CBF, MTT and mean/median Tmax over the ROI, and the fraction of ROI pixels whose
-Tmax differs from the reference. A swap is analysed only when both the reference and the donor AIF are trusted
-(aif_taxonomy.py).
-
-Analyses
-    1. % change: log ratio swap / ref (Tmax: difference of the ROI mean, s); median, IQR, Wilcoxon, Holm over the
-       four parameters of a swap.
-    2. Bland-Altman per parameter per swap (log scale; parametric and non-parametric 95 % limits).
-    3. Within-patient change vs between-patient spread: RMS of the log ratio swap/ref (includes bias) divided by
-       the between-patient SD of the log reference value (per plane, one run per patient). Ratio < 1: the AIF
-       choice moves a patient less than patients differ from each other.
-    4. Rank stability: Spearman rho between the reference and the swapped values over the patients, per plane.
-    5. Tmax: does the earlier arrival of the grown AIF (0.10-0.15 s) shift Tmax? Mean Tmax shift, fraction of
-       pixels changed, and Spearman of the shift with the arrival difference top - grown.
-    6. A vs B maps of the same injection: total log(B_own / A_own) split into an AIF part log(B_own / B with
-       A-AIF) and a tissue part log(B with A-AIF / A_own).
-
-Output: <out>/sq4_aif_swap/  swap_values.csv (raw, per run x swap), sq4_change.csv, sq4_within_between.csv,
-        sq4_rank.csv, sq4_tmax.csv, sq4_decomposition.csv, table_sq4.tex, change.png, ba_<swap>.png,
-        decomposition.png, roi_examples.png, sq4_report.md
-
-Example:
-    python scripts/sq4_aif_swap.py results/combined_v1            # computes (~10 min) and analyses
-    python scripts/sq4_aif_swap.py results/combined_v1 --report-only
+    python scripts/sq4_aif_swap.py [--report-only]
 """
 
 import argparse
@@ -56,7 +15,8 @@ from scipy.ndimage import binary_opening, uniform_filter1d
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from aif_truncation import load_frames, normalise, perfusion, sample_aif  # noqa: E402
-from sq1_full_vs_top import fmt_p, holm, md_table  # noqa: E402
+from sq1_full_vs_top import holm  # noqa: E402
+from paths import DATA, SQ4
 
 PARAMS = ["CBV", "CBF", "MTT", "Tmax"]
 SWAPS = {"model": "segment: ica_full_model", "grown": "segment: ica_full_grown",
@@ -68,9 +28,6 @@ DT = 0.25
 SWAP_COL = {"model": "#7a7a7a", "grown": "#2f9e44", "cross": "#eb6834", "cross_peak": "#f4a582"}
 
 
-# ----------------------------------------------------------------------------
-# Computation
-# ----------------------------------------------------------------------------
 def parenchyma_roi(frames):
     s = 1 - frames / 170
     enh = uniform_filter1d(s, 3, axis=2).max(axis=2) - np.median(s[..., :2], axis=2)
@@ -168,9 +125,6 @@ def plot_roi_examples(path):
     plt.close(fig)
 
 
-# ----------------------------------------------------------------------------
-# Analysis
-# ----------------------------------------------------------------------------
 def wide(vals):
     """Per run: reference and swapped values side by side, valid swaps only."""
     ref = vals[vals.swap == "ref"].set_index("run_id")
@@ -293,9 +247,6 @@ def decomposition(vals):
     return pd.DataFrame(rows)
 
 
-# ----------------------------------------------------------------------------
-# Figures, table, report
-# ----------------------------------------------------------------------------
 def plot_change(t, wb, path):
     """Top: change per swap (median, IQR) for A tissue and B tissue. Bottom: within / between ratio."""
     fig, axes = plt.subplots(2, 2, figsize=(14, 8.5))
@@ -385,110 +336,67 @@ def plot_decomposition(dec, path):
 
 
 def tex_table(t, wb, rank, path):
+    # the report compares ICA-top with ICA-full (the grown mask) only
+    names = {"grown": "ICA-full", "cross": "ICA-top of the other plane",
+             "cross_peak": "ICA-top of the other plane, peak-matched (shape only)"}
+
+    def num(x, digits):
+        s = f"{x:+.{digits}f}"
+        if float(s) == 0:
+            return f"{0:.{digits}f}"
+        return s.replace("-", "$-$")
+
     lines = ["\\begin{table*}[t]", "\\centering",
-             "\\caption{Effect of the AIF on the perfusion maps with the tissue curves held fixed, for plane A and plane B "
-             "tissue. Change: median (IQR) of the swapped map relative to the map with the run's own \\texttt{ica\\_top} "
-             "AIF over a fixed parenchymal region (Tmax: shift of the region mean, s); $^\\ast p_\\mathrm{Holm} < 0.05$ "
-             "(Wilcoxon, four parameters per swap and plane). Ratio: within-patient change (RMS) / between-patient SD. "
-             "$\\rho$: Spearman rank correlation of the patients between reference and swap.}",
-             "\\label{tab:sq4}", "\\footnotesize", "\\begin{tabular}{ll rrr rrr}", "\\hline",
-             " & & \\multicolumn{3}{c}{Plane A tissue} & \\multicolumn{3}{c}{Plane B tissue} \\\\",
-             "AIF swap & Param. & Change (IQR) & Ratio & $\\rho$ & Change (IQR) & Ratio & $\\rho$ \\\\", "\\hline"]
-    for swap in SWAPS:
-        for j, k in enumerate(PARAMS):
+             "\\caption{Effect of the AIF on the perfusion maps with the tissue curves held fixed, per plane of the tissue. "
+             "Change: median (IQR) relative to the map with the run's own ICA-top AIF, over a fixed parenchymal region; "
+             "$^\\ast$: $p_\\mathrm{Holm} < 0.05$ (Wilcoxon, four parameters per AIF and plane). Ratio: RMS change divided by "
+             "the between-patient SD, so above 1 the AIF moves the value more than patients differ. $\\rho$: Spearman "
+             "correlation of the patient ranking between the two AIFs. $n$: runs; runs with a collapsed map are excluded "
+             "except for Tmax.}",
+             "\\label{tab:sq4}", "\\footnotesize", "\\begin{tabular}{l rrr rrr}", "\\hline",
+             " & \\multicolumn{3}{c}{Plane A tissue} & \\multicolumn{3}{c}{Plane B tissue} \\\\",
+             "Parameter & Change (IQR) & Ratio & $\\rho$ & Change (IQR) & Ratio & $\\rho$ \\\\", "\\hline"]
+    for swap in names:
+        ns = [t[(t.swap == swap) & (t.param == "CBV") & (t.plane == plane)].n.iloc[0] for plane in ("A", "B")]
+        lines.append(f"\\multicolumn{{7}}{{l}}{{\\textit{{{names[swap]}}} ($n$ = {ns[0]} A, {ns[1]} B)}} \\\\")
+        for k in PARAMS:
             cells = []
             for plane in ("A", "B"):
                 r = t[(t.swap == swap) & (t.param == k) & (t.plane == plane)].iloc[0]
                 star = "$^\\ast$" if r.p_holm < 0.05 else ""
                 if k == "Tmax":
-                    eff = f"{r['median']:+.2f} ({r.q1:+.2f}, {r.q3:+.2f}){star}"
+                    eff = f"{num(r['median'], 2)} ({num(r.q1, 2)}, {num(r.q3, 2)}){star}"
                 else:
-                    eff = (f"{np.expm1(r['median']):+.0%} ({np.expm1(r.q1):+.0%}, {np.expm1(r.q3):+.0%})"
-                           .replace("%", "\\%") + star)
+                    eff = (f"{num(np.expm1(r['median']) * 100, 0)} ({num(np.expm1(r.q1) * 100, 0)}, "
+                           f"{num(np.expm1(r.q3) * 100, 0)}){star}")
                 ratio = wb[(wb.swap == swap) & (wb.param == k) & (wb.plane == plane)].ratio.iloc[0]
                 rho = rank[(rank.comparison == f"{swap} vs ref") & (rank.param == k) & (rank.plane == plane)].rho.iloc[0]
-                cells += [eff, f"{ratio:.2f}", f"{rho:.2f}"]
-            name = SWAPS[swap] if j == 0 else ""
-            lines.append(f"{name} & {k} & " + " & ".join(cells) + " \\\\")
+                cells += [eff, f"{ratio:.2f}", f"{num(rho, 2).lstrip('+')}"]
+            unit = "s" if k == "Tmax" else "\\%"
+            lines.append(f"{k} ({unit}) & " + " & ".join(cells) + " \\\\")
         lines.append("\\hline")
     lines += ["\\end{tabular}", "\\end{table*}"]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def write_report(out_dir, vals, w, t, wb, rank, tm, dec, command):
-    n_runs = vals.run_id.nunique()
-    roi = vals[vals.swap == "ref"].roi_px / 1024 ** 2
-    tt = t.copy()
-    for c in ["median", "q1", "q3", "np_low", "np_high", "loa_low", "loa_high"]:
-        tt[c] = [fmt(v, k) for v, k in zip(tt[c], tt.param)]
-    tt["p_holm"] = tt.p_holm.map(fmt_p)
-    wbs = wb.pivot_table(index=["swap", "param"], columns="plane", values="ratio").round(2).reset_index()
-    rk = rank.pivot_table(index=["comparison", "param"], columns="plane", values="rho").round(3).reset_index()
-    dd = pd.DataFrame([{"parameter": k, **{part: f"{np.exp(dec[f'{k}_{part}'].median()):.2f} "
-                                              f"({np.exp(dec[f'{k}_{part}'].quantile(0.25)):.2f}-"
-                                              f"{np.exp(dec[f'{k}_{part}'].quantile(0.75)):.2f})"
-                                              for part in ("total", "aif", "tissue")}}
-                       for k in ("CBV", "CBF", "MTT")])
-    txt = f"""# SQ4 — AIF swap, tissue fixed ({out_dir.parent.name})
-
-Generated by `scripts/sq4_aif_swap.py`; do not edit by hand, re-run instead.
-
-```bash
-{command}
-```
-
-{n_runs} runs ({vals.ab_pair_id.nunique()} A/B pairs). Fixed parenchymal ROI per run: median {roi.median():.0%} of the
-image (IQR {roi.quantile(0.25):.0%}-{roi.quantile(0.75):.0%}); examples in `roi_examples.png`. A swap is used when both
-the reference (own ica_top) and the donor AIF are trusted.
-
-## 1-2. Change per swap and Bland-Altman
-
-Log ratio swap / reference as %, Tmax as shift of the ROI mean (s). Wilcoxon, Holm per swap. `change.png`,
-`ba_<swap>.png`.
-
-{md_table(tt[["swap", "plane", "param", "n", "collapsed", "median", "q1", "q3", "loa_low", "loa_high", "np_low", "np_high", "p_holm"]])}
-
-## 3. Within-patient change vs between-patient spread
-
-RMS of the log change (incl. bias) / between-patient SD of the log reference value, per plane. < 1: the AIF choice
-moves a patient less than patients differ.
-
-{md_table(wbs)}
-
-## 4. Rank stability (Spearman rho of the patients)
-
-{md_table(rk)}
-
-## 5. Does the earlier grown AIF shift Tmax?
-
-{md_table(tm.round(3))}
-
-## 6. A vs B maps of the same injection: AIF part and tissue part
-
-Median ratio (IQR), {len(dec)} injections with both ica_top AIFs trusted. total = B map / A map (each with its own
-AIF); aif = B map with B-AIF / B map with A-AIF; tissue = B map with A-AIF / A map. total = aif x tissue.
-`decomposition.png`.
-
-{md_table(dd)}
-"""
-    (out_dir / "sq4_report.md").write_text(txt, encoding="utf-8")
-
-
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("out", type=Path)
+    p.add_argument("out", type=Path, nargs="?", default=DATA, help="data folder")
     p.add_argument("--report-only", action="store_true", help="Analyse the saved swap_values.csv.")
     p.add_argument("--limit", type=int, default=0, help="Only the first N A/B pairs (testing).")
     args = p.parse_args()
     out = args.out
-    out_dir = out / "sq4_aif_swap"
+    out_dir = SQ4
     out_dir.mkdir(parents=True, exist_ok=True)
     acq = pd.read_csv(out / "acquisition_table.csv").set_index("run_id")
-    tax = pd.read_csv(out / "aif_qc" / "taxonomy" / "taxonomy_labels.csv")
+    tax = pd.read_csv(out / "qc" / "taxonomy" / "taxonomy_labels.csv")
     trust = tax.set_index(["run_id", "variant"]).trust.to_dict()
 
     if args.report_only:
         vals = pd.read_csv(out_dir / "swap_values.csv")
+        # the perfusion values stay valid after a QC change; the trust flags do not
+        vals["ref_trusted"] = [trust.get((r, "ica_top")) == "trusted" for r in vals.run_id]
+        vals["donor_trusted"] = [trust.get(k) == "trusted" for k in zip(vals.donor_run, vals.donor_variant)]
     else:
         vals = compute(out, acq, trust, args.limit)
         if args.limit:
@@ -509,12 +417,10 @@ def main():
     dec = decomposition(vals)
     dec.to_csv(out_dir / "sq4_decomposition.csv", index=False)
     plot_change(t, wb, out_dir / "change.png")
-    for swap in SWAPS:
+    for swap in ("grown", "cross"):
         plot_ba(w, t, swap, out_dir / f"ba_{swap}.png")
     plot_decomposition(dec, out_dir / "decomposition.png")
     tex_table(t, wb, rank, out_dir / "table_sq4.tex")
-    write_report(out_dir, vals, w, t, wb, rank, tm, dec, " ".join(["python"] + sys.argv))
-    print(open(out_dir / "sq4_report.md", encoding="utf-8").read())
 
 
 if __name__ == "__main__":

@@ -1,92 +1,6 @@
-"""
-Build the per-run x per-AIF-variant feature table for the statistics (SQ1-SQ4).
+"""AIF and perfusion features per run x variant (features.csv and paired tables).
 
-Input  (in <out>, a postprocess_combined.py + select_runs.py result such as results/combined_v1):
-    acquisition_table.csv, selection.csv, perfusion_summary.csv, aif_curves.csv, npz/<run_id>.npz
-Output (in <out>):
-    features.csv            long, one row per run_id x variant (ica_top, ica_full_model, ica_full_grown)
-    features_paired.csv     wide, one row per patient x variant, <feature>_A / <feature>_B for every
-                            numeric/boolean feature, only runs with in_paired_set (SQ2: plane A vs B)
-    features_full_vs_top.csv  wide, one row per run, <feature>_top / _model / _grown for every
-                            variant-dependent feature, run-level covariates once (SQ1: full vs top)
-    features_summary.csv    median [min-max] and n per numeric feature per variant (all runs)
-
-Identifiers / covariates (run level, identical for the three variants)
-    from acquisition_table.csv: dataset, patient_id, plane (A = frontal, primary angle ~0 deg (up to
-    ~35 deg); B = lateral, ~-90 deg), ab_pair_id, injection_site, frame_rate_regime,
-    frame_interval_ms_median, duration_s, kvp, magnification, primary_angle_deg,
-    secondary_angle_deg, is_duplicate
-    from selection.csv: evt_phase, included (the one-plane-per-patient selection)
-    in_paired_set   injection site is an ICA (R ICA / L ICA / ICA), the run is not a duplicate, and
-                    both planes A and B of its ab_pair_id satisfy the same (74 runs / 37 patients)
-
-Perfusion (from perfusion_summary.csv, per variant)
-    mask_px, mask_components, perfused_px, CBV/CBF/MTT/Tmax _median and _mean
-
-AIF features (per variant, from aif_curves.csv, sampling == resampled_250ms unless stated; the
-resampled curves share a 250 ms grid starting at t = 0 = the first frame after the mask frame)
-    c(t) is the AIF, i_pk = argmax c (global maximum), t the sample times.
-    aif_baseline        b = median of the first 2 samples of c
-    aif_peak            c(i_pk) - b  (baseline-corrected peak height; NaN-producing cases below)
-    aif_ttp_s           t(i_pk), time to peak from t = 0 (on the 250 ms grid, so 0.25 s resolution)
-    aif_arrival_s       bolus arrival: first time before/at the peak at which c rises above
-                        b + f * peak, linear interpolation between the bracketing samples;
-                        f = --arrival-frac (default 0.2). Identical algorithm to
-                        postprocess_combined.arrival_time (used for aif_arrival_s_ica_top).
-                        If the first sample is already above the level, t(0) is returned and
-                        aif_arrival_at_start is set.
-    aif_arrival_10_s    the same at f = 0.10 (always reported; aif_arrival_90_s at f = 0.90)
-    aif_arrival_native_s / aif_arrival_native_10_s
-                        the same on the native (non-resampled, variable frame interval) curve,
-                        sampling == native
-    aif_rise_s          aif_ttp_s - aif_arrival_s
-    aif_rise_10_90_s    aif_arrival_90_s - aif_arrival_10_s
-    aif_fwhm_s          full width at half maximum: right minus left crossing of b + peak/2,
-                        both linearly interpolated, the left one searched before, the right one
-                        after the peak. If c does not fall back below half maximum before the
-                        end of the acquisition, aif_fwhm_s is NaN and aif_fwhm_censored is set
-                        (the width is then > end - left crossing).
-    aif_auc             trapezoidal integral of c - b over the whole curve (t = 0 to the last
-                        sample), not clipped, in AIF units x s
-    Shape-only (amplitude removed). Curve / peak: FWHM, rise times and arrival times are
-    invariant to scaling, so their normalised versions equal the columns above and are not
-    repeated. The remaining shape-only features:
-    aif_auc_norm_s      AUC of (c - b) / peak = aif_auc / aif_peak (s; the "effective width")
-    aif_peak_norm       peak of (c - b) / AUC = aif_peak / aif_auc (1/s)
-    aif_centroid_s      first moment of the AUC-normalised curve, using max(c - b, 0)
-    aif_sd_s            square root of its second central moment (temporal spread)
-    aif_n_peaks         number of peaks of (c - b) / peak found by scipy.signal.find_peaks with
-                        prominence >= --peak-prominence (default 0.1, i.e. 10 % of the peak);
-                        the global maximum counts when it is an interior sample, plus 1 if the
-                        global maximum is the last sample (find_peaks ignores edge samples)
-    aif_tail_frac       (c(last) - b) / peak, the remaining enhancement at the end of the run
-    aif_truncated       aif_tail_frac > --tail-threshold (default 0.3): the bolus has not washed
-                        out within the acquisition (truncated curve, venous/recirculation tail)
-    aif_late_rise       largest re-rise after the peak, max over k > i_pk of
-                        (c(k) - min c(i_pk..k)) / peak, stored as aif_late_rise_amp; the flag
-                        aif_late_rise is aif_late_rise_amp > --late-rise-threshold (default 0.15),
-                        i.e. after falling the curve rises again by > 15 % of the peak
-                        (second pass / venous contamination)
-    aif_peak_at_end     the global maximum is the last sample (curve still rising at the end)
-    NaN rules: all AIF features are NaN when the curve is all-NaN (no mask) or peak <= 0 (the
-    curve never rises above its baseline). Arrival/rise columns are additionally NaN when the
-    crossing does not exist before the peak, which cannot happen for f in (0, 1] once peak > 0.
-
-Saturation (per variant, from npz/<run_id>.npz: minip and mask_<variant>, 0..255 scale where
-low = more contrast)
-    sat_frac            fraction of mask pixels with MINIP <= --sat-level (default 2)
-    minip_min           minimum MINIP value inside the mask
-    minip_median        median MINIP value inside the mask
-
-Temporal agreement (per variant, resampled curves, both on the same 250 ms grid from t = 0;
-truncated to the shorter length)
-    r_vs_top            Pearson r with the ica_top curve of the same run (1 for ica_top itself)
-    r_ab                Pearson r with the same variant of the A/B partner run: same ab_pair_id,
-                        other plane, same is_duplicate value (duplicates pair with duplicates);
-                        NaN when there is no partner
-
-Example:
-    python scripts/build_features.py results/combined_v1
+    python scripts/build_features.py
 """
 
 import argparse
@@ -95,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy.signal import find_peaks
+from paths import DATA
 
 VARIANTS = ["ica_top", "ica_full_model", "ica_full_grown"]
 SHORT = {"ica_top": "top", "ica_full_model": "model", "ica_full_grown": "grown"}
@@ -105,9 +20,6 @@ PERF_COLS = ["mask_px", "mask_components", "perfused_px"] + [f"{m}_{s}" for m in
                                                               for s in ("median", "mean")]
 
 
-# ----------------------------------------------------------------------------
-# Curve features
-# ----------------------------------------------------------------------------
 def crossing_up(t, c, level, i_end):
     """First upward crossing of `level` in c[:i_end + 1], linearly interpolated (t[0] if c[0] is above)."""
     above = np.nonzero(c[:i_end + 1] >= level)[0]
@@ -197,9 +109,6 @@ def pearson(a, b):
     return float(np.corrcoef(a, b)[0, 1])
 
 
-# ----------------------------------------------------------------------------
-# Tables
-# ----------------------------------------------------------------------------
 def build(out, args):
     acq = pd.read_csv(out / "acquisition_table.csv")
     sel = pd.read_csv(out / "selection.csv")[["run_id", "evt_phase", "included"]]
@@ -297,7 +206,7 @@ def summary(feat):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("out", type=Path, help="Combined result folder, e.g. results/combined_v1")
+    p.add_argument("out", type=Path, nargs="?", default=DATA, help="data folder")
     p.add_argument("--arrival-frac", type=float, default=0.2, help="Fraction of the rise that defines arrival.")
     p.add_argument("--peak-prominence", type=float, default=0.1, help="find_peaks prominence, fraction of peak.")
     p.add_argument("--tail-threshold", type=float, default=0.3, help="Tail fraction above which a curve is truncated.")

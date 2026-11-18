@@ -1,54 +1,6 @@
-"""
-AIF truncation: how much does a curve that has not washed out bias the perfusion maps, which tail level
-is acceptable, and what do the obviously truncated runs look like when fixed by hand?
+"""Truncation threshold: simulated truncation of complete curves, and repair of the truncated cases.
 
-Part A — simulation (data-driven truncation threshold)
-    Runs with a trusted ica_top AIF that washes out completely (aif_qc post_min <= SIM_MAX_POST_MIN and at
-    least SIM_MIN_FOLLOW_S recorded after the peak) are made "truncated" at tail level L (fraction of
-    the peak) in the two ways a curve ends up truncated:
-        short_run   the acquisition stops early: the uniform 250 ms sequence (AIF and tissue) ends at the
-                    first frame after the peak where the baseline-corrected AIF falls to L
-        aif_floor   the run is complete but contrast lingers in the AIF mask (veins over the ICA, slow
-                    outflow): after the peak the AIF is max(AIF, L), the tissue curves are unchanged
-    In both, L is the "tail fraction" the QC thresholds (aif_qc TRUNC_LEVEL = 0.3). The perfusion maps
-    are recomputed with the unchanged perfDSA deconvolution and compared with those of the full run:
-    bias = median over the perfused pixels of the full run (CBV > 0) of the modified map / same median of
-    the full map - 1. Per scenario the threshold is the highest L at which the median |bias| of CBV, CBF
-    and MTT over the runs stays below MAX_BIAS.
-
-Part A2 — optimal scan duration (method of de la Rosa et al. 2023, PLoS One 18:e0283610)
-    Frames are removed one at a time from the end of each simulation run (AIF and tissue). A shortened run
-    is reliable when CBV, CBF and MTT all deviate < MAX_BIAS from the full run (their reliability
-    criterion: lesion volumes within 10 %). The optimal scan duration (OSD) of a run is the shortest
-    duration from which on every longer version is reliable. Reported per run: AIF coverage = OSD - AIF
-    peak time (their most predictive truncation feature), post-bolus time = OSD - arrival (the quantity of
-    Lyman et al. 2026, Transl Stroke Res, who need >= 7 s in DSA for a reliable MTT), and the AIF tail
-    fraction at the OSD (the level the AIF has fallen to when the run becomes reliable). The P95 over the
-    runs is the requirement that makes 95 % of runs reliable; the cohort is then checked against it.
-
-Part B — the obviously truncated runs (meeting 19 Oct: PRAISE084 A/B, 082_B, 071_B)
-    Each variant is recomputed three ways:
-        original   as in the pipeline
-        cut        the sequence ends at the minimum of the AIF after the peak (removes a re-rising tail;
-                   a plateau stays)
-        gamma      the AIF is replaced by a gamma-variate fit of its first pass (arrival to the frame
-                   where it has fallen to GAMMA_FIT_TO of the peak), which extrapolates the washout to
-                   baseline; the tissue curves are unchanged. This is the standard repair of a truncated
-                   AIF.
-    For each: AIF tail fraction, map medians and their change against the original; one figure per run
-    with the three AIFs and the four maps.
-
-Input : <out>/acquisition_table.csv (DICOM source), npz/<run_id>.npz (masks, stored maps),
-        aif_qc/aif_qc_labels.csv, aif_qc/taxonomy/taxonomy_labels.csv (trust)
-Output: <out>/aif_qc/truncation/
-    truncation_sim.csv        run x level: map medians, bias
-    truncation_sim.png        bias vs level (median, IQR) with the threshold
-    truncation_cases.csv      case x variant x method: tail fraction, map medians, change vs original
-    case_<run_id>.png         AIFs and maps per method
-    truncation_report.md
-
-Example:
-    python scripts/aif_truncation.py results/combined_v1
+    python scripts/aif_truncation.py [--report-only]
 """
 
 import argparse
@@ -66,6 +18,7 @@ from cohort_common import MAP_KEYS, ROOT, parse_source, rd
 
 sys.path.insert(0, str(ROOT))
 from DSASequence import DSASequence  # noqa: E402
+from paths import DATA
 
 VARIANTS = ["ica_top", "ica_full_model", "ica_full_grown"]
 CASES = ["PRAISE_PRAISE084_01_S12_A", "PRAISE_PRAISE084_01_S12_B", "PRAISE_PRAISE082_01_S12_B",
@@ -86,9 +39,6 @@ TH = dict(
 )
 
 
-# ----------------------------------------------------------------------------
-# Perfusion
-# ----------------------------------------------------------------------------
 def load_frames(source):
     ds = rd.read_dicom(parse_source(source))
     return rd.load_uniform_sequence(ds, FRAME_INTERVAL_MS, 1024)
@@ -127,9 +77,6 @@ def tail_fraction(aif):
     return float(yn[i_pk:].min())
 
 
-# ----------------------------------------------------------------------------
-# Part A: simulation
-# ----------------------------------------------------------------------------
 def simulate(out, acq, lab, th):
     top = lab[lab.variant == "ica_top"]
     sel = top[(top.trust == "trusted") & (top.post_min <= th["SIM_MAX_POST_MIN"])
@@ -280,9 +227,6 @@ def plot_sim_row(axes, s, threshold, th, title):
     axes[0].set_ylabel(f"{title}\nmedian map / full - 1")
 
 
-# ----------------------------------------------------------------------------
-# Part B: the obviously truncated runs
-# ----------------------------------------------------------------------------
 def gamma_variate(t, a, t0, alpha, beta):
     dt = np.clip(t - t0, 0, None)
     return a * dt ** alpha * np.exp(-dt / beta)
@@ -355,16 +299,6 @@ def plot_case(run_id, res, path):
     plt.close(fig)
 
 
-# ----------------------------------------------------------------------------
-# Report
-# ----------------------------------------------------------------------------
-def md_table(df):
-    cols = [str(c) for c in df.columns]
-    rows = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
-    rows += ["| " + " | ".join("" if pd.isna(x) else str(x) for x in r) + " |" for r in df.itertuples(index=False)]
-    return "\n".join(rows)
-
-
 def per_run_reliability(sim, lab, th):
     """aif_floor: per level, runs whose CBV, CBF and MTT all stay within MAX_BIAS (the per-scan criterion of
     de la Rosa et al.), and how many trusted curves the level would reject."""
@@ -381,148 +315,9 @@ def per_run_reliability(sim, lab, th):
     return pd.DataFrame(rows).sort_values("tail fraction", ascending=False)
 
 
-def write_report(out_dir, summs, thresholds, cases, lab, th, command, n_sim, osd, check, req, rel):
-    sim_md = []
-    for scen, title in SCENARIOS.items():
-        s = summs[scen].copy()
-        for k in MAP_KEYS:
-            s[f"{k} median"] = s[f"{k} median"].map("{:+.1%}".format)
-        sim_md.append(f"**{scen}: {title}** — threshold **{thresholds[scen]}**\n\n{md_table(s.reset_index())}")
-    sim_md = "\n\n".join(sim_md)
-    c = cases.copy()
-    for k in MAP_KEYS:
-        c[f"change_{k}"] = c[f"change_{k}"].map("{:+.0%}".format)
-        c[k] = c[k].round(3)
-    c["tail_frac"] = c.tail_frac.round(2)
-    c["run_id"] = c.run_id.str.replace("PRAISE_PRAISE", "PRAISE")
-    qc = lab[lab.run_id.isin(CASES)][["run_id", "variant", "category", "trust", "post_min", "end_frac", "tail_slope",
-                                      "follow_s", "venous_frac"]].round(3)
-    qc["run_id"] = qc.run_id.str.replace("PRAISE_PRAISE", "PRAISE")
-    o = cases[cases.method != "original"]
-    txt = f"""# AIF truncation — {out_dir.parent.parent.name}
-
-Generated by `scripts/aif_truncation.py`; do not edit by hand, re-run instead.
-
-```bash
-{command}
-```
-
-Thresholds: {", ".join(f"{k} {v}" for k, v in th.items())}
-
-## A. Simulation: which tail fraction is acceptable?
-
-{n_sim} runs with a trusted ica_top AIF that washes out completely (minimum after the peak <= {th["SIM_MAX_POST_MIN"]},
->= {th["SIM_MIN_FOLLOW_S"]} s after the peak) were made truncated at tail fraction L in the two ways it happens,
-and the maps recomputed with the unchanged deconvolution. Bias = median of the modified map over the perfused
-pixels / same median of the full run - 1 (median and IQR over the runs). Threshold = highest L with median
-|bias| of CBV, CBF and MTT < {th["MAX_BIAS"]:.0%}. Figure: `truncation_sim.png`.
-
-{sim_md}
-
-Reading:
-- **short_run** cuts the tissue curves too. The capillary/venous phase comes after the AIF peak, so a run that
-  stops while the AIF is still at 30-70 % of its peak loses most of the tissue area: CBV and MTT collapse. This
-  is an acquisition requirement (keep recording until the AIF is below the threshold), not an AIF-QC rule.
-- **aif_floor** is what the QC's `truncated` category (and the four runs of part B) actually is: a complete run
-  whose AIF does not wash out. Its threshold is the one for the AIF QC (aif_qc TRUNC_LEVEL = 0.3).
-
-## A2. Optimal scan duration (method of de la Rosa et al. 2023)
-
-Frames removed one at a time from the end; a version is reliable when CBV, CBF and MTT deviate < {th["MAX_BIAS"]:.0%}
-from the full run; OSD = shortest duration from which on every longer version is reliable. Per run
-(`truncation_osd.csv`, figure `truncation_osd.png`):
-
-{md_table(osd[["coverage_s", "post_bolus_s", "tail_frac_at_osd"]].describe(percentiles=[0.05, 0.5, 0.95]).round(2).reset_index())}
-
-Requirements that make 95 % of runs reliable: **AIF coverage >= {req[0]:.2f} s** after the AIF peak,
-**post-bolus time >= {req[1]:.2f} s** after arrival ({ARRIVAL_FRAC:.0%} of the peak), equivalently the AIF must have
-fallen to **<= {req[2]:.2f} of its peak** (P5 of the tail fraction at the OSD).
-
-What the cohort's ica_top curves have (native frames; `truncation_cohort_coverage.csv`):
-
-{md_table(check)}
-
-## Literature basis
-
-No AIF-truncation threshold exists for DSA perfusion with perfDSA: the perfDSA paper (Su et al. 2025, IJCARS,
-doi:10.1007/s11548-025-03359-4) does not define one. The threshold here is built from published definitions:
-
-- **Definition of truncation**: incomplete capture of the wash-in or wash-out of the first-pass bolus
-  (Borst et al. 2015, PLoS One, doi:10.1371/journal.pone.0119409); the acute-stroke CTP recommendations they cite
-  ask for complete wash-out of AIF and VOF. Borst found AIF truncation in 2/36 and VOF truncation in 7/36 short
-  (48 s) CTP scans; truncation underestimates CBV because CBV is the ratio of tissue and AIF areas.
-- **Reliability criterion (10 %)**: de la Rosa et al. 2023 (PLoS One, doi:10.1371/journal.pone.0283610) call a
-  truncated scan reliable if its perfusion lesion volumes deviate < 10 % (or < 5 ml) from the untruncated scan;
-  MAX_BIAS = 10 % uses the same bound on the map medians.
-- **Method and predictor**: de la Rosa et al. remove the last frame one at a time to find the optimal scan
-  duration; the best single predictor of unreliable truncation is the AIF coverage (scan end - AIF peak,
-  ROC-AUC 0.98, better than scan duration). In CTP 13 s (mean) / 20 s (P95) of coverage was needed; part A2
-  repeats this for DSA.
-- **Magnitude**: Copen et al. 2014 (AJNR, doi:10.3174/ajnr.A4186) showed that shortening MR perfusion scans
-  falsely lowers CBV by 48-64 % and raises MTT by 133-205 % of normal; the CBV/MTT sensitivity found here
-  (CBF much less affected) matches their pattern.
-- **DSA-specific**: Lyman et al. 2026 (Transl Stroke Res, doi:10.1007/s12975-026-01420-1) simulated truncation of
-  DSA runs and needed >= 7 s of post-bolus data (with gamma-variate extrapolation) for a reliable MTT. Without
-  extrapolation (perfDSA) the requirement can only be longer.
-
-## Recommendation
-
-Two questions, two answers:
-
-1. **AIF QC (the curve does not wash out while the run continues; the `truncated` category).** Scenario
-   aif_floor, judged with the 10 % reliability bound of de la Rosa et al. Per level, group-level (median) bias and
-   per-run reliability, and what the level would cost in currently trusted curves:
-
-{md_table(rel)}
-
-   - **Tail fraction <= {thresholds["aif_floor"]}** keeps the median CBV/MTT bias within {th["MAX_BIAS"]:.0%}
-     (the 0.30 used so far gives about -36 % CBV / -30 % MTT). This is the threshold for the AIF QC: the
-     analyses compare groups of paired curves, so the group-level bias is the relevant quantity.
-   - The per-scan criterion of de la Rosa et al. is stricter: at 0.15 not every run is within 10 %. Use 0.10 as a
-     **sensitivity analysis** (repeat the main comparisons with it), not as the primary threshold, because it
-     rejects about a third of the trusted curves.
-
-2. **Acquisition length (the whole run stops early; tissue curves are cut as well).** Runs became reliable at a
-   median of {osd.post_bolus_s.median():.1f} s after bolus arrival, in line with the >= 7 s Lyman et al. found
-   for DSA; for 95 % of runs {req[1]:.1f} s was needed. Many PRAISE runs are shorter (table in A2). This cannot be
-   repaired by AIF QC and affects the absolute CBV/MTT values; it largely cancels in the paired comparisons
-   (full vs top: same run; plane A vs B: same injection and run length), so report it as a limitation and add
-   the post-bolus time per run as a covariate / flag rather than excluding runs.
-
-## B. The obviously truncated runs (meeting 19 Oct)
-
-QC of the four runs (aif_qc + trust):
-
-{md_table(qc)}
-
-Each variant recomputed three ways (`case_<run_id>.png`: AIFs, CBV and MTT maps):
-- **cut**: the run ends at the AIF minimum after the peak (removes a re-rising tail; a plateau stays).
-- **gamma**: the AIF is replaced by a gamma-variate fit of its first pass (down to {th["GAMMA_FIT_TO"]} of the
-  peak, dotted line), which extrapolates the washout to baseline; the tissue curves stay.
-
-Change = median of the map over the perfused pixels of the original / original - 1.
-
-{md_table(c[["run_id", "variant", "method", "n_frames", "end_s", "tail_frac"] + list(MAP_KEYS) + [f"change_{k}" for k in MAP_KEYS]])}
-
-Range of the change over the four runs and three variants:
-
-{md_table(o.groupby("method")[[f"change_{k}" for k in MAP_KEYS]].agg(["min", "median", "max"]).round(3).reset_index().set_axis(
-    ["method"] + [f"{k} {s}" for k in MAP_KEYS for s in ("min", "median", "max")], axis=1))}
-
-## Caveats
-
-- aif_floor is a simple model of a lingering tail (a flat floor); a rising venous tail (PRAISE084_A grown) is
-  worse than a floor at the same level.
-- PRAISE082_B has median Tmax 0.25 s and CBV an order of magnitude above the other runs in every variant: its
-  residue functions peak at the first frame, so its maps are unreliable regardless of truncation.
-- The gamma fit assumes a single, smooth first pass; for multi-peak curves it is not meaningful.
-"""
-    (out_dir / "truncation_report.md").write_text(txt, encoding="utf-8")
-
-
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("out", type=Path, help="combined result folder, e.g. results/combined_v1")
+    p.add_argument("out", type=Path, nargs="?", default=DATA, help="data folder")
     for k, v in TH.items():
         p.add_argument(f"--{k.lower().replace('_', '-')}", type=type(v), default=v)
     p.add_argument("--report-only", action="store_true",
@@ -530,15 +325,15 @@ def main():
     args = p.parse_args()
     th = {k: getattr(args, k.lower()) for k in TH}
     out = args.out
-    out_dir = out / "aif_qc" / "truncation"
+    out_dir = out / "qc" / "truncation"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     acq = pd.read_csv(out / "acquisition_table.csv").set_index("run_id")
-    lab = pd.read_csv(out / "aif_qc" / "aif_qc_labels.csv").merge(
-        pd.read_csv(out / "aif_qc" / "taxonomy" / "taxonomy_labels.csv")[["run_id", "variant", "trust"]],
+    lab = pd.read_csv(out / "qc" / "aif_qc_labels.csv").merge(
+        pd.read_csv(out / "qc" / "taxonomy" / "taxonomy_labels.csv")[["run_id", "variant", "trust"]],
         on=["run_id", "variant"])
 
-    if args.report_only:  # re-use the saved simulation (the full run takes about an hour)
+    if args.report_only:
         cases = pd.read_csv(out_dir / "truncation_cases.csv")
         sim = pd.read_csv(out_dir / "truncation_sim.csv")
     else:
@@ -561,8 +356,6 @@ def main():
     print(check.to_string())
     rel = per_run_reliability(sim, lab, th)
     print(rel.to_string(index=False))
-    write_report(out_dir, summs, thresholds, cases, lab, th, " ".join(["python"] + sys.argv), sim.run_id.nunique(),
-                 osd, check, req, rel)
 
 
 if __name__ == "__main__":

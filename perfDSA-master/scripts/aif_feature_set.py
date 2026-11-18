@@ -1,49 +1,6 @@
-"""
-Final AIF feature set of a combined-cohort result: every AIF feature per curve, with its QC labels, in
-one folder with a data dictionary, ready for the statistics.
+"""Final AIF feature set (timing, amplitude, shape-only) with QC labels and a data dictionary.
 
-The curve features themselves come from build_features.curve_features (the same code that made
-features.csv), now with the thresholds from scripts/aif_features_config.json instead of command-line
-defaults, plus the features build_features does not have:
-    aif_auc_first_pass      integral of c - b from the 10 % arrival to the first frame after the peak where
-                            the curve has fallen below first_pass_end_frac of the peak (or the end): the
-                            first-pass area without the venous/recirculation tail that aif_auc includes
-    aif_first_pass_end_s    end of that window; aif_first_pass_censored when the curve never falls that far
-    aif_mtt_bolus_s         centroid of the curve minus the arrival time: mean transit time of the bolus
-                            through the ICA, independent of when the run started (aif_centroid_s is from t = 0)
-    aif_skewness            third standardised moment of the AUC-normalised curve (shape: > 0 = long tail)
-    aif_up_down_ratio       rise time (arrival -> peak) / fall time (peak -> right half-max crossing)
-
-Arrival threshold
-    arrival_frac (config) is the fraction of the peak at which the bolus "arrives". arrival_threshold.csv
-    checks every candidate fraction two ways: precision (both planes of one injection see the same bolus
-    at the same moment, so the spread of arrival_A - arrival_B over the trusted pairs is the measurement
-    noise) and noise floor (trusted curves whose 3-sigma baseline noise, 3 / aif_qc SNR, reaches the
-    level). The rule: the smallest fraction above the noise of every trusted curve; the script warns if the
-    config differs.
-
-Feature groups (column prefix in features_aif.csv; feature_dictionary.csv has unit and definition per column)
-    id / acquisition    run_id, variant, patient, plane, pair, injection site, frame regime, kVp, ...
-    qc                  qc_category (aif_qc.py), qc_taxonomy, qc_trust (aif_taxonomy.py), qc_included
-    timing              arrival (at arrival_frac, 10 %, 90 %), TTP, rise times, FWHM, MTT of the bolus
-    amplitude           peak, AUC, first-pass AUC, baseline
-    shape_peak          peak-normalised (amplitude removed, c / peak): FWHM, rise times, AUC / peak,
-                        up/down ratio, n_peaks, tail fraction, late rise
-    shape_auc           AUC-normalised (c / AUC): peak / AUC, centroid, SD, skewness
-    perfusion           mask size and CBV/CBF/MTT/Tmax medians (perfusion_summary)
-
-Output: <out>/aif_features/
-    features_aif.csv          long, one row per run x variant (all unique runs; filter on qc_trust)
-    features_paired_AB.csv    wide <feature>_A / _B, pairs where both planes are trusted (SQ2)
-    features_full_vs_top.csv  wide <feature>_top / _model / _grown, runs where all three are trusted (SQ1)
-    curves_shape.csv          arrival-aligned curves on a common grid: c / peak and c / AUC (for shape plots)
-    feature_dictionary.csv    column, group, unit, shape_only, definition
-    arrival_threshold.csv     A/B arrival disagreement per candidate fraction
-    config_used.json          the config this run used
-    README.md                 what is where, how to load it
-
-Example:
-    python scripts/aif_feature_set.py results/combined_v1
+    python scripts/aif_feature_set.py
 """
 
 import argparse
@@ -59,9 +16,9 @@ from scipy.stats import median_abs_deviation
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_features import crossing_down, crossing_up, curve_features  # noqa: E402
+from paths import DATA
 
 CONFIG = Path(__file__).resolve().parent / "aif_features_config.json"
-VARIANTS = ["ica_top", "ica_full_model", "ica_full_grown"]
 SHORT = {"ica_top": "top", "ica_full_model": "model", "ica_full_grown": "grown"}
 
 # column -> (group, unit, shape_only, definition)
@@ -129,9 +86,6 @@ def load_config(path):
     return {k: v for k, v in cfg.items() if not k.startswith("_")}
 
 
-# ----------------------------------------------------------------------------
-# Features
-# ----------------------------------------------------------------------------
 def extra_features(t, c, f, cfg):
     """Features build_features.curve_features does not compute (needs its output f)."""
     e = dict(aif_auc_first_pass=np.nan, aif_first_pass_end_s=np.nan, aif_first_pass_censored=np.nan,
@@ -213,91 +167,19 @@ def pick_arrival_frac(arr):
     return float(ok.arrival_frac.min()) if len(ok) else np.nan
 
 
-# ----------------------------------------------------------------------------
-# Output
-# ----------------------------------------------------------------------------
-def md_table(df):
-    cols = [str(c) for c in df.columns]
-    rows = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
-    rows += ["| " + " | ".join("" if pd.isna(x) else str(x) for x in r) + " |" for r in df.itertuples(index=False)]
-    return "\n".join(rows)
-
-
-def write_readme(out_dir, feat, arr, cfg, command, n_pairs, n_fvt):
-    n = feat.groupby("variant").qc_trust.value_counts().unstack().reindex(VARIANTS).fillna(0).astype(int)
-    best = pick_arrival_frac(arr)
-    sd = arr.sd_A_minus_B_s
-    groups = pd.Series({k: v[0] for k, v in DICTIONARY.items()}).value_counts()
-    txt = f"""# AIF feature set — {out_dir.parent.name}
-
-Generated by `scripts/aif_feature_set.py` with `scripts/aif_features_config.json`; do not edit by hand, re-run instead.
-
-```bash
-{command}
-```
-
-Config used (`config_used.json`): {", ".join(f"{k} {v}" for k, v in cfg.items() if k != "arrival_frac_candidates")}
-
-## Files
-
-| file | rows | use |
-|---|---|---|
-| `features_aif.csv` | one per run x variant ({len(feat)}) | everything; filter `qc_trust == "trusted"` |
-| `features_paired_AB.csv` | one per injection x variant, both planes trusted ({n_pairs} for ica_top) | SQ2 plane A vs B |
-| `features_full_vs_top.csv` | one per run, all three variants trusted ({n_fvt}) | SQ1 full vs top |
-| `curves_shape.csv` | run x variant x grid point | arrival-aligned c/peak and c/AUC, for shape plots |
-| `feature_dictionary.csv` | one per column | group, unit, shape-only flag, definition |
-| `arrival_threshold.csv` | one per candidate fraction | choice of arrival_frac |
-
-Columns are grouped (see `feature_dictionary.csv`): {", ".join(f"{g} ({k})" for g, k in groups.items())}.
-`shape_only = True` marks features that do not change when the curve is scaled (peak- or AUC-normalised):
-use these to compare curve *shape* between masks/planes independent of the contrast amount.
-
-Trust per variant (all unique runs):
-
-{md_table(n.reset_index())}
-
-## Arrival threshold
-
-Two objective checks per candidate fraction:
-- **precision**: both planes see the same bolus at the same moment, so the A - B arrival difference measures
-  arrival-time noise (ica_top, pairs trusted in both planes);
-- **noise floor**: the level must lie above the baseline noise, otherwise noise triggers the "arrival";
-  `trusted_curves_noise_above` counts trusted curves whose 3-sigma frame noise (3 / aif_qc SNR) reaches it.
-
-{md_table(arr.round(3))}
-
-The precision hardly depends on the fraction (SD {sd.min():.3f}-{sd.max():.3f} s, well below the 250 ms frame
-interval), so the noise floor decides. **Rule: the smallest fraction above the 3-sigma noise of every trusted
-curve = {best}** (config: {cfg["arrival_frac"]}). It is in the conventional 10-20 % range and the closest to the true
-onset that is still noise-free. The 10 % and 90 % crossings are always reported as well.
-
-## Load
-
-```python
-import pandas as pd
-d = 'results/combined_v1/aif_features'
-f = pd.read_csv(f'{{d}}/features_aif.csv')
-ok = f[f.qc_trust == 'trusted']
-shape_cols = pd.read_csv(f'{{d}}/feature_dictionary.csv').query('shape_only').column.tolist()
-```
-"""
-    (out_dir / "README.md").write_text(txt, encoding="utf-8")
-
-
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("out", type=Path, help="combined result folder, e.g. results/combined_v1")
+    p.add_argument("out", type=Path, nargs="?", default=DATA, help="data folder")
     p.add_argument("--config", type=Path, default=CONFIG)
     args = p.parse_args()
     out, cfg = args.out, load_config(args.config)
-    out_dir = out / "aif_features"
+    out_dir = out / "features"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     curves = pd.read_csv(out / "aif_curves.csv")
     curves = curves[curves.sampling == "resampled_250ms"].sort_values(["run_id", "variant", "time_s"])
     old = pd.read_csv(out / "features.csv")
-    tax = pd.read_csv(out / "aif_qc" / "taxonomy" / "taxonomy_labels.csv").rename(
+    tax = pd.read_csv(out / "qc" / "taxonomy" / "taxonomy_labels.csv").rename(
         columns={"category": "qc_category", "taxonomy": "qc_taxonomy", "trust": "qc_trust", "included": "qc_included"})
     base = (old[~old.is_duplicate][[c for c in ID_COLS] + PERF_COLS]
             .merge(tax[["run_id", "variant"] + QC_COLS], on=["run_id", "variant"]))
@@ -334,8 +216,6 @@ def main():
     pd.DataFrame([dict(column=k, group=g, unit=u, shape_only=s, definition=d) for k, (g, u, s, d) in DICTIONARY.items()
                   if k in feat]).to_csv(out_dir / "feature_dictionary.csv", index=False)
     (out_dir / "config_used.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    write_readme(out_dir, feat, arr, cfg, " ".join(["python"] + sys.argv),
-                 int((paired.variant == "ica_top").sum()), len(fvt))
     print(arr.round(3).to_string(index=False))
     print(feat.groupby("variant").qc_trust.value_counts().unstack())
 

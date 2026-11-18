@@ -1,31 +1,6 @@
-"""
-Run perfDSA over the whole dataset with two AIF variants and build an acquisition table.
+"""Run perfDSA on every DICOM run in the dataset roots (ica_top AIF + ica_full AIF).
 
-    ica_top  : AIF sampled from the mask of models/best_model_ica_top.pt  (ICA top)
-    ica_full : AIF sampled from the full ICA, grown down the vessel from the ICA-top mask
-               on the MINIP, avoiding veins found by their timing (see arterial_full_ica). With
-               --ica-full model it comes from models/best_model_ica.pt instead; note that model
-               was trained on ICA-top labels as well and gives nearly the same mask.
-
-Input : one or more dataset roots (default ../PRAISE and ../EX_AGNES). Every multi-frame
-        DICOM (.dcm / .IMA, also inside .tar archives) is one run; single-frame screenshots
-        and reference images are skipped. Runs stored un-subtracted (ImageType ORIGINAL with
-        a MaskSubtractionSequence, e.g. EX_AGNES) are subtracted here with their own mask frame.
-
-Output (in -o, default ./results/dataset_run):
-    acquisition_table.csv    one row per run: acquisition parameters from the DICOM header
-    acquisition_summary.csv  per dataset: median [min-max] of the numeric parameters
-    perfusion_summary.csv    one row per run x variant: mask size, AIF features, map medians
-    aif_curves.csv           long format: run_id, variant, time_s, aif
-    errors.csv               runs that failed, with the error message
-    figures/<variant>/<run_id>.png   AIF, MINIP + mask, CBV, CBF, MTT, Tmax
-    maps/<variant>/<run_id>.npz      (only with --save-maps)
-    runs/<run_id>.json       per-run cache; finished runs are skipped on restart
-
-Examples:
-    python run_dataset.py
-    python run_dataset.py --table-only
-    python run_dataset.py -i ../PRAISE -o results/praise --save-maps
+    python run_dataset.py -i ../PRAISE ../PRAISE_BATCH_2 -o results/data/raw_model --save-maps --ica-full model
 """
 
 import os
@@ -62,9 +37,6 @@ DICOM_SUFFIXES = (".dcm", ".ima")
 DSA_BASE_LEVEL = 170 / 255  # background level DSASequence assumes for subtracted images
 
 
-# ----------------------------------------------------------------------------
-# File access (Windows long paths, files inside .tar archives)
-# ----------------------------------------------------------------------------
 def long_path(p):
     """PRAISE paths exceed the 260 char Windows limit; the \\\\?\\ prefix lifts it."""
     s = str(Path(p).resolve())
@@ -98,9 +70,6 @@ def iter_dicom_sources(root):
                             yield (path, m.name)
 
 
-# ----------------------------------------------------------------------------
-# Run discovery + acquisition table
-# ----------------------------------------------------------------------------
 def is_dsa_run(ds, min_frames):
     image_type = [str(t).upper() for t in ds.get("ImageType", [])]
     return (ds.get("Modality") == "XA" and int(ds.get("NumberOfFrames", 1)) >= min_frames
@@ -228,12 +197,9 @@ def summarise_acquisitions(acq):
             v = g[c].dropna()
             row[c] = f"{v.median():.4g} [{v.min():.4g}, {v.max():.4g}]" if len(v) else ""
         rows.append(row)
-    return pd.DataFrame(rows).set_index("dataset").T  # parameters as rows, datasets as columns
+    return pd.DataFrame(rows).set_index("dataset").T
 
 
-# ----------------------------------------------------------------------------
-# Loading + preprocessing (follows perfDSA.load_and_preprocess_dicom)
-# ----------------------------------------------------------------------------
 def load_uniform_sequence(ds, frame_interval_ms, size, native_subtraction="log", native_vessel_level=20):
     """Return a uniformly-timed (H,W,N) DSA sequence scaled to 0..255, like perfDSA.py.
 
@@ -286,9 +252,6 @@ def load_uniform_sequence(ds, frame_interval_ms, size, native_subtraction="log",
     return np.transpose(255 * seq.astype(np.float32) / full_scale, (1, 2, 0))
 
 
-# ----------------------------------------------------------------------------
-# Segmentation + perfusion
-# ----------------------------------------------------------------------------
 def pick_device(device):
     if device == "cuda" and not torch.cuda.is_available():
         logging.info("CUDA requested but not available, using CPU instead.")
@@ -454,7 +417,7 @@ def process_run(run, nets, device, args, out):
     result = {"run_id": run["run_id"], "n_frames_uniform": frames.shape[2],
               "top_prob_max": top_prob_max, "variants": {}}
     for variant, mask in masks.items():
-        if not mask.any():  # keep the other variant; report this one in errors.csv
+        if not mask.any():
             result["variants"][variant] = {"error": "empty ICA mask"}
             continue
         n_components = cv.connectedComponents(mask.astype(np.uint8))[0] - 1
@@ -479,9 +442,6 @@ def process_run(run, nets, device, args, out):
     return result
 
 
-# ----------------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------------
 def get_args():
     p = argparse.ArgumentParser(description="Run perfDSA (ICA full + ICA top) over a whole dataset.")
     p.add_argument("-i", dest="inputs", nargs="+",
@@ -564,7 +524,7 @@ def main():
     nets = {"ica_top": load_model(ICA_TOP_MODEL, device)}
     if args.ica_full == "model":
         nets["ica_full"] = load_model(ICA_MODEL, device)
-    if args.sample:  # evenly spread over the run list, so both datasets are covered
+    if args.sample:
         runs = [runs[i] for i in np.unique(np.linspace(0, len(runs) - 1, args.sample).astype(int))]
         logging.info("Processing a sample of %d runs", len(runs))
 

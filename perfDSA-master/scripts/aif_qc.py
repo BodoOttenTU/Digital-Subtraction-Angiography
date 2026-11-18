@@ -1,84 +1,6 @@
-"""
-Quality control of the AIF curves of a combined-cohort result (postprocess_combined.py + select_runs.py +
-build_features.py, e.g. results/combined_v1): sort every curve (run x variant) into one failure category or
-`usable`, explain per curve why it failed and what most likely caused it, and write the list of usable AIFs.
+"""Shape QC of every AIF curve: one failure category (or usable) per curve, plus the list of usable AIFs.
 
-Deterministic: the same inputs and thresholds give the same labels. The thresholds are module constants
-(overridable on the command line) and are written to aif_qc/qc_config.json together with the MD5 of every
-input table, so a result can always be traced back to its inputs.
-
-Curve used
-    aif_curves.csv, sampling == native: the frames as acquired (variable interval 250/500/1000 ms), not the
-    250 ms resampled curve, which is a linear interpolation and would hide frame-to-frame noise and notches.
-    Each curve is baseline-corrected and normalised to its own peak: yn = (c - base) / (max c - base), so
-    0 = pre-bolus baseline and 1 = peak and all thresholds are fractions of the bolus amplitude.
-    base = median of the frames before the bolus arrives (before the first frame >= 10 % of the rise, at
-    least the first frame).
-
-Features (per curve)
-    n_base        frames before the 10 % arrival (pre-bolus baseline frames)
-    base_spread   peak-to-peak of yn over those frames
-    snr           1 / noise, noise = 1.4826 * MAD of the second difference of yn / sqrt(6), taken over the
-                  pre-arrival frames and the tail after washout only (outside the first pass, so a jagged
-                  bolus is not mistaken for noise)
-    t_peak, t_end, follow_s = t_end - t_peak (seconds recorded after the peak)
-    post_min      min of yn from the peak to the end (does the curve ever wash out?)
-    end_frac      yn at the last frame
-    tail_slope    (yn[last] - yn at t_end - 2 s) / 2 s, peak fractions per second: ~0 = a plateau, < 0 = still
-                  washing out when the run stops
-    fwhm_s        full width at half maximum (NaN if it never falls below 0.5: censored)
-    i_wash        first frame after the peak below WASHED_OUT; frames before it are the first pass
-    excess        back-and-forth movement during the first pass that a single up-down bolus does not have:
-                  sum |diff yn| over the first pass - (1 - yn[0]) - (1 - yn[i_wash - 1])
-    notch_side    where the largest dip of the first pass is: "upslope" (before the peak) or "downslope"
-    notch_depth   that largest dip (drop below the running maximum on the upslope, rise above the running
-                  minimum on the downslope)
-    n_peaks       peaks of yn above 0.3 with prominence >= PEAK_PROM inside the first pass
-    peak_gap_s    time between the two highest of those peaks (NaN with one peak)
-    rebound       largest rise above the running minimum after washout (second bolus / venous overlap)
-    t_rebound_s   time of the rebound maximum after the AIF peak
-    rough         mean |yn - 3-frame running median of yn| over the tail (washout to end). A monotone
-                  stretch equals its running median, so smooth decay, the knee after washout and the bends
-                  at the 250/500/1000 ms frame-rate switches give 0; only single-frame zig-zags
-                  (frame-to-frame noise) count. (A plain second difference was tried first, but on the
-                  variable frame interval it flagged smooth tails as noisy.)
-
-Categories (first matching rule in this order is the category; every triggered rule is in `flags`)
-    low_signal    snr < MIN_SNR: no bolus clearly above the frame-to-frame noise
-    no_baseline   n_base < MIN_BASE_FRAMES (bolus already arriving at the first frame) or
-                  base_spread > BASE_DRIFT: arrival time and amplitude are not defined
-    truncated     post_min > TRUNC_LEVEL: the acquisition ends before the bolus has washed out, the area
-                  under the curve and the tail of the residue function are cut off
-    multi_peak    excess > BOLUS_EXCESS: the first pass is not one smooth bolus (two peaks, notch, step)
-    late_rise     rebound > LATE_REBOUND: after washout the curve rises again
-    noisy         rough > ROUGH_MAX: one clean bolus but a zig-zagging tail
-    usable        none of the above
-    Minor flags (do not change the category, listed so borderline curves can be checked):
-    minor_notch (excess > BOLUS_EXCESS/2), minor_rebound (rebound > LATE_REBOUND/2), minor_noise
-    (rough > ROUGH_MAX/2), slow_washout
-    (end_frac > TAIL_ELEVATED), broad_bolus (fwhm_s > BROAD_FWHM_S or censored).
-
-Cause attribution (the `cause` column; rule based on run context, so it is also reproducible)
-    context from acquisition_table.csv (injection site, duration, frame pattern), selection.csv
-    (venous_frac per variant, included), features.csv (mask_px, sat_frac, r_vs_top, r_ab). Two
-    comparisons separate the origin of a defect:
-      - the A/B partner plane of the same injection, same variant: a defect in both planes is in the
-        bolus itself (injection, haemodynamics, acquisition protocol); in one plane only it comes from the
-        projection (vessel overlap, motion, foreshortening).
-      - the other masks of the same run: a defect in one variant only comes from that mask (which pixels
-        it averages), not from the acquisition.
-
-Output (in <out>/aif_qc/)
-    aif_qc_labels.csv     one row per run x variant: category, flags, reason, cause, features, context
-    aif_qc_summary.csv    counts per category x variant (all runs and the 37 included runs)
-    usable_aifs.csv       one row per run: usable per variant, category per variant, included, and
-                          use_primary (the included run with a usable ica_top AIF)
-    qc_config.json        thresholds, input MD5s, script command
-    aif_qc_report.md      how to reproduce, method, per-category explanation, per-curve reasons
-    grid_<variant>_<category>.png  every curve of that category (native frames), for visual checking
-
-Example:
-    python scripts/aif_qc.py results/combined_v1
+    python scripts/aif_qc.py
 """
 
 import argparse
@@ -92,24 +14,23 @@ import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
 from scipy.signal import find_peaks, medfilt
+from paths import DATA
 
 VARIANTS = ["ica_top", "ica_full_model", "ica_full_grown"]
 CATEGORIES = ["usable", "low_signal", "no_baseline", "truncated", "multi_peak", "late_rise", "noisy"]
 ORDER = CATEGORIES[1:]  # priority of the failure rules
 COLORS = {"ica_top": "C3", "ica_full_model": "C0", "ica_full_grown": "C2"}
 
-# Thresholds (fractions of the bolus amplitude unless stated). The first-pass, rebound, truncation and
-# roughness values are those of classify_aif.py (earlier PRAISE runs), checked visually on combined_v1.
 TH = dict(
-    MIN_SNR=8.0,            # peak / frame noise below this -> low_signal
-    MIN_BASE_FRAMES=2,      # fewer pre-arrival frames -> no_baseline
-    BASE_DRIFT=0.12,        # spread of the baseline frames -> no_baseline
-    TRUNC_LEVEL=0.3,        # never below this after the peak -> truncated (same as build_features --tail-threshold)
+    MIN_SNR=10.0,           # peak / frame noise below this -> low_signal
+    MIN_BASE_FRAMES=3,      # fewer pre-arrival frames -> no_baseline
+    BASE_DRIFT=0.10,        # spread of the baseline frames -> no_baseline
+    TRUNC_LEVEL=0.2,        # never below this after the peak -> truncated
     WASHED_OUT=0.5,         # below this after the peak = end of the first pass
     PEAK_PROM=0.08,         # prominence of a counted first-pass peak
     BOLUS_EXCESS=0.2,       # first-pass back-and-forth -> multi_peak
-    LATE_REBOUND=0.2,       # rise after washout -> late_rise
-    ROUGH_MAX=0.012,        # tail zig-zag (mean |y - running median|) -> noisy
+    LATE_REBOUND=0.15,      # rise after washout -> late_rise
+    ROUGH_MAX=0.015,        # tail zig-zag (mean |y - running median|) -> noisy
     TAIL_ELEVATED=0.2,      # end_frac above this -> slow_washout flag
     BROAD_FWHM_S=4.0,       # FWHM above this -> broad_bolus flag
     VENOUS_HIGH=0.2,        # venous_frac (select_runs.py) above this counts as venous overlap in the mask
@@ -120,9 +41,6 @@ TH = dict(
 )
 
 
-# ----------------------------------------------------------------------------
-# Curve features
-# ----------------------------------------------------------------------------
 def curve_features(t, c, th):
     t, c = np.asarray(t, float), np.asarray(c, float)
     i_pk = int(np.argmax(c))
@@ -212,9 +130,6 @@ def classify(f, th):
     return cat, flags
 
 
-# ----------------------------------------------------------------------------
-# Reasons and causes
-# ----------------------------------------------------------------------------
 def describe(r, th):
     """What is wrong with the curve, in numbers (one sentence per triggered failure flag)."""
     s = []
@@ -340,59 +255,6 @@ def causes(r, th, partner_cat, other_cats, r_pair):
     return verdict + (" — evidence: " + "; ".join(ev) if ev else "")
 
 
-# ----------------------------------------------------------------------------
-# Report
-# ----------------------------------------------------------------------------
-# What each category means, why it breaks the deconvolution, and how it can arise in a cerebral DSA run.
-CATEGORY_TEXT = {
-    "low_signal": (
-        "No bolus clearly above the frame-to-frame noise.",
-        "The AIF amplitude scales CBV/CBF directly and its shape sets the deconvolution kernel; when noise "
-        "is of the order of the bolus, both are undefined.",
-        "Mask placed on a segment that barely opacifies (wrong vessel, segmentation in background), strong "
-        "contrast dilution (CCA injection with most contrast going to the ECA), or a very small mask."),
-    "no_baseline": (
-        "No stable pre-bolus baseline: fewer than 2 frames before the 10 % arrival, or the pre-arrival frames "
-        "drift by more than 12 % of the peak.",
-        "Baseline subtraction, arrival time and every amplitude depend on it; a drifting baseline adds an "
-        "offset to the whole curve.",
-        "Injection started before the acquisition (contrast already in the mask frame, so it is subtracted "
-        "away), or patient motion between the mask frame and the first frames (subtraction misregistration "
-        "shows up as a drifting background)."),
-    "truncated": (
-        "The curve never falls below 30 % of its peak after the maximum.",
-        "The area under the AIF and the tail of the residue function are cut off, so CBV (area ratio) and "
-        "MTT are biased and the SVD deconvolution sees a step at the end of the run.",
-        "Either the run stops too early for the bolus (short acquisition, slow/long injection: still "
-        "washing out at the last frame), or contrast stays in the mask (tail plateau): veins/sinus or "
-        "parenchymal blush projected over the ICA, or slow/stagnant ICA outflow in front of a distal "
-        "occlusion. The tail slope of the last 2 s separates the two."),
-    "multi_peak": (
-        "The first pass is not one smooth bolus: two peaks, a notch or a step on the up- or downslope "
-        "(back-and-forth movement > 20 % of the peak before washout).",
-        "A deconvolution kernel with two bumps produces oscillating residue functions; Tmax/MTT jump "
-        "between the two peaks.",
-        "Irregular injection (hand injection with a pause, injector pressure limit), pulsatile inflow "
-        "(peaks one heartbeat apart), splitting of a CCA bolus at the bifurcation, ECA branches projected "
-        "over the ICA mask (second arrival front, CCA injections), patient motion during the first pass, or "
-        "the coarse sampling at the 250 -> 500 ms frame-interval switch turning a smooth downslope into "
-        "steps. Seen in both planes = in the bolus itself; one plane only = projection."),
-    "late_rise": (
-        "After washing out the curve rises again by more than 20 % of the peak.",
-        "The tail of the AIF is no longer arterial: the deconvolution attributes the venous/second-pass "
-        "signal to the arterial input, which shortens MTT and distorts CBF.",
-        "Venous phase (cortical veins, sinus) projected over the ICA mask (venous_frac high, re-rise "
-        "4-7 s after the peak), a late-filling ECA branch overlapping in one projection, or a real second "
-        "bolus (second injection, recirculation) when both planes show it."),
-    "noisy": (
-        "One clean bolus, but a zig-zagging tail (mean deviation from the 3-frame running median > 1.2 % of "
-        "the peak).",
-        "Noise in the AIF is amplified by deconvolution (ill-posed); the truncated-SVD threshold then cuts "
-        "real signal.",
-        "Small or thin mask (few pixels averaged), low contrast-to-noise, motion in the tail frames, the "
-        "1 fps tail sampling (each frame carries more weight), or overlap with a vessel that pulsates."),
-}
-
 CAUSE_CLASS = [("irregular bolus", "injection / bolus"), ("ECA branches", "ECA overlap (CCA injection)"),
                ("projection-specific", "projection (overlap / motion)"),
                ("venous phase", "venous / late overlap"), ("a late-filling", "venous / late overlap"),
@@ -407,110 +269,6 @@ def cause_class(cause):
     return next((c for k, c in CAUSE_CLASS if cause.startswith(k)), "") if cause else ""
 
 
-def md_table(df):
-    rows = ["| " + " | ".join(df.columns) + " |", "|" + "---|" * len(df.columns)]
-    rows += ["| " + " | ".join(str(v).replace("|", "/") for v in r) + " |" for r in df.itertuples(index=False)]
-    return rows
-
-
-def write_report(out, lab, use, summ, th, command):
-    uniq = lab[~lab.is_duplicate]
-    fail = uniq[uniq.category != "usable"]
-    short = lambda s: s.replace("PRAISE_BATCH_2_", "B2_").replace("PRAISE_", "")
-    n_dup = int(lab.is_duplicate.sum() / lab.variant.nunique())
-    L = ["# AIF quality control — " + out.name, "",
-         f"Generated by `scripts/aif_qc.py`; do not edit by hand, re-run instead. {len(lab)} curves = "
-         f"{lab.run_id.nunique()} runs x {lab.variant.nunique()} variants; the {n_dup} duplicate runs are "
-         f"labelled but left out of all counts and lists below.", "",
-         "## Reproduce", "",
-         "```bash", "conda activate BEP", "cd perfDSA-master", command.replace("\\", "/"), "```", "",
-         "Inputs (all in the result folder; their MD5 is in `aif_qc/qc_config.json`): `aif_curves.csv` "
-         "(native frames), `acquisition_table.csv`, `selection.csv` (venous_frac, included), `features.csv` "
-         "(mask_px, r_vs_top). No randomness: the same inputs and thresholds give the same labels. To change a "
-         "threshold, pass it on the command line (e.g. `--bolus-excess 0.25`); it is recorded in "
-         "`qc_config.json`.", "",
-         "Thresholds:", ""]
-    L += md_table(pd.DataFrame([(k, str(v)) for k, v in th.items()], columns=["name", "value"]))
-    L += ["", "## Method", "",
-          "1. Take the **native** curve (frames as acquired; the 250 ms resampled curve is a linear "
-          "interpolation and hides frame noise and notches).",
-          "2. Subtract the pre-arrival baseline and divide by the peak, so 0 = baseline, 1 = peak; every "
-          "threshold is a fraction of the bolus amplitude, independent of dose and DSA scaling.",
-          "3. Compute the shape features (see the script docstring) and test the six failure rules. The "
-          "**category** is the first failing rule in the order low_signal → no_baseline → truncated → "
-          "multi_peak → late_rise → noisy (most fundamental first: without a bolus or baseline nothing else "
-          "is defined; truncation invalidates the integral; then first-pass shape, then tail). **flags** "
-          "lists every rule that fired plus the minor (borderline) flags.",
-          "4. Attribute a **cause** with fixed rules from the run context: the other plane of the same "
-          "injection (same defect in both planes = in the bolus; one plane only = projection), the other "
-          "masks of the same run (another mask passes = the defect comes from which pixels this mask "
-          "averages; a near-identical curve, r ≥ R_TWIN, passes = borderline), injection site (CCA), "
-          "venous_frac, tail slope, frame-interval switch, mask size.",
-          "5. Thresholds: first-pass, rebound and truncation levels are those of the earlier `classify_aif.py` "
-          "/ `build_features.py` (tail 0.3). The noise rule was redesigned here because a second difference "
-          "flags the smooth bends at the 250/500/1000 ms switches; all grids were checked visually.", "",
-          "## Result", ""]
-    s = summ.reset_index().rename(columns={"index": "category"})
-    for name in ("all_unique_runs", "included_runs"):
-        L += [f"**{name.replace('_', ' ')}**", ""] + md_table(s[s.set == name].drop(columns="set")) + [""]
-    cc = fail.groupby(["cause_class", "variant"]).size().unstack(fill_value=0).reindex(columns=VARIANTS,
-                                                                                         fill_value=0)
-    L += ["Most likely cause of the failed curves (all unique runs):", ""] + md_table(cc.reset_index()) + [""]
-    inc = use[use.included]
-    L += [f"**Selected runs (one plane per patient, {len(inc)}): {int(inc.use_primary.sum())} have a usable "
-          f"ica_top AIF.** Of the {int((~inc.use_primary).sum())} that fail, "
-          f"{int((inc.alt_plane_run_if_failed != '').sum())} have a usable ica_top AIF in the other plane "
-          f"(`alt_plane_run_if_failed`).", ""]
-    L += md_table(inc[~inc.use_primary][["run_id", "injection_site"] + [f"category_{v}" for v in VARIANTS]
-                                        + ["alt_plane_run_if_failed"]])
-    L += ["", "## Categories", ""]
-    for cat in ORDER:
-        what, why, how = CATEGORY_TEXT[cat]
-        sub = fail[fail.category == cat].sort_values(["run_id", "variant"])
-        n = sub.groupby("variant").size().reindex(VARIANTS, fill_value=0)
-        L += [f"### {cat} ({', '.join(f'{v} {k}' for v, k in n.items())})", "",
-              f"**What:** {what}", "", f"**Why it fails:** {why}", "", f"**How it can happen:** {how}", ""]
-        if len(sub):
-            top = sub.cause_class.value_counts()
-            L += ["**In this cohort:** " + ", ".join(f"{k} {v}" for k, v in top.items())
-                  + f". Curves: `aif_qc/grid_<variant>_{cat}.png`.", ""]
-            L += md_table(sub.assign(run=sub.run_id.map(short), inc=sub.included.map({True: "yes", False: ""}),
-                                     flags=sub["flags"].str.replace(";", ", "))
-                          [["run", "variant", "inc", "flags", "reason", "cause"]])
-        else:
-            L += ["None in this cohort."]
-        L += [""]
-    L += ["## Continue with the usable AIFs", "",
-          "`aif_qc/usable_aifs.csv` has one row per run: `category_<variant>`, `usable_<variant>`, "
-          "`n_usable_variants`, `included` (selection), `use_primary` (included and ica_top usable) and "
-          "`alt_plane_run_if_failed`. `aif_qc/aif_qc_labels.csv` has every feature, flag, reason and cause "
-          "per curve.", "",
-          "```python",
-          "import pandas as pd",
-          f"res = 'results/{out.name}'",
-          "use = pd.read_csv(f'{res}/aif_qc/usable_aifs.csv')",
-          "primary = use[use.use_primary]                                 # selected runs, usable ica_top",
-          "all_top = use[use.usable_ica_top & ~use.is_duplicate]           # every run with usable ica_top",
-          "all3 = use[(use.n_usable_variants == 3) & ~use.is_duplicate]    # full vs top comparison",
-          "lab = pd.read_csv(f'{res}/aif_qc/aif_qc_labels.csv')[['run_id', 'variant', 'category']]",
-          "feat = pd.read_csv(f'{res}/features.csv').merge(lab, on=['run_id', 'variant'])",
-          "feat_ok = feat[feat.category == 'usable']",
-          "```", "",
-          "For paired comparisons (A vs B, full vs top) keep only pairs in which **both** curves are usable, "
-          "otherwise the QC selects on the outcome of one side.", "",
-          "## Caveats", "",
-          "- The cause is the most likely explanation given the available context, not a verified diagnosis; "
-          f"check doubtful runs in the viewer (`results/{out.name}/viewer`).",
-          "- Curves with minor flags (`minor_notch`, `minor_rebound`, `minor_noise`, `slow_washout`, "
-          "`broad_bolus`) pass but sit close to a threshold; a sensitivity analysis without them is cheap.",
-          "- `borderline` failures have a near-identical twin (another mask, r ≥ R_TWIN) that passes: "
-          "the label flips on small threshold changes.", ""]
-    (out / "aif_qc" / "aif_qc_report.md").write_text("\n".join(L), encoding="utf-8")
-
-
-# ----------------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------------
 def md5(p):
     return hashlib.md5(Path(p).read_bytes()).hexdigest()
 
@@ -542,9 +300,9 @@ def plot_grid(lab, yn, title, path):
 
 
 def run(out, th, command):
-    qc = out / "aif_qc"
+    qc = out / "qc"
     qc.mkdir(exist_ok=True)
-    for f in qc.glob("grid_*.png"):  # categories can become empty between runs
+    for f in qc.glob("grid_*.png"):
         f.unlink()
     inputs = {n: out / n for n in ("aif_curves.csv", "acquisition_table.csv", "selection.csv", "features.csv")}
     curves = pd.read_csv(inputs["aif_curves.csv"])
@@ -594,7 +352,6 @@ def run(out, th, command):
     lab = lab[lead + [c for c in lab.columns if c not in lead]]
     lab.round(4).to_csv(qc / "aif_qc_labels.csv", index=False)
 
-    # summary
     summ = []
     for name, sub in (("all_unique_runs", lab[~lab.is_duplicate]), ("included_runs", lab[lab.included])):
         tab = sub.groupby(["category", "variant"]).size().unstack(fill_value=0).reindex(
@@ -605,7 +362,6 @@ def run(out, th, command):
     summ = pd.concat(summ)
     summ.to_csv(qc / "aif_qc_summary.csv")
 
-    # usable list (one row per run)
     w = lab.pivot(index="run_id", columns="variant", values="category")[VARIANTS]
     use = lab.drop_duplicates("run_id").set_index("run_id")[
         ["dataset", "patient_id", "plane", "ab_pair_id", "injection_site", "evt_phase", "is_duplicate", "included"]]
@@ -623,22 +379,20 @@ def run(out, th, command):
     use = use.reset_index().fillna({"alt_plane_run_if_failed": ""})
     use.to_csv(qc / "usable_aifs.csv", index=False)
 
-    # grids
     for v in VARIANTS:
         for c in CATEGORIES:
             sub = lab[(lab.variant == v) & (lab.category == c) & ~lab.is_duplicate]
-            plot_grid(sub, yn, f"{out.name} | {v} | {c} (n={len(sub)})", qc / f"grid_{v}_{c}.png")
+            plot_grid(sub, yn, f"{v} | {c} (n={len(sub)})", qc / f"grid_{v}_{c}.png")
 
     cfg = dict(command=command, thresholds=th, inputs={n: md5(p) for n, p in inputs.items()},
                curve_sampling="native", n_curves=len(lab))
     (qc / "qc_config.json").write_text(json.dumps(cfg, indent=2))
-    write_report(out, lab, use, summ, th, command)
     return lab, use, summ
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("out", type=Path, help="combined result folder, e.g. results/combined_v1")
+    p.add_argument("out", type=Path, nargs="?", default=DATA, help="data folder")
     for k, v in TH.items():
         if not isinstance(v, tuple):
             p.add_argument(f"--{k.lower().replace('_', '-')}", type=type(v), default=v)

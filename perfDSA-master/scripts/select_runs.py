@@ -1,27 +1,6 @@
-"""
-Select one run per patient for the analysis, with the reason for every excluded run.
+"""Select one run per patient and record why every other run is excluded.
 
-Criteria, in this order (every run gets all reasons that apply):
-    1. not a duplicate copy of another run
-    2. injection site ICA (CCA and unknown sites are excluded)
-    3. plane A or B known, and an ica_top result exists (AIF + maps)
-    4. per injection, the plane whose ICA-top AIF mask has the least venous overlap:
-         venous_frac   fraction of mask pixels that are still opaque late, i.e. their maximum
-                       concentration from `--venous-delay` s after the AIF peak on is more than
-                       `--late-ratio` times their maximum up to 1 s after the peak (an artery has
-                       washed out by then, a vein crossing the ICA is filling)
-         aif_tail      the same late/early ratio of the mask-mean AIF, baseline-corrected
-       Lowest venous_frac wins; within `--tie` of each other, the lower aif_tail wins.
-       Both metrics are also given for the two ICA-full masks.
-
-Every patient has one injection (one A/B pair), so this leaves at most one run per patient.
-
-Output (in <out>):
-    selection.csv       one row per run: included, reasons, evt_phase, venous metrics
-    dataset_report.md   '## Selection' section added (or replaced)
-
-Example:
-    python scripts/select_runs.py results/combined_v1
+    python scripts/select_runs.py
 """
 
 import argparse
@@ -33,6 +12,7 @@ import numpy as np
 import pandas as pd
 
 from cohort_common import parse_source, rd
+from paths import DATA
 
 VARIANTS = ["ica_top", "ica_full_model", "ica_full_grown"]
 
@@ -68,7 +48,7 @@ def venous_metrics(frames, mask, dt_s, venous_delay_s, late_ratio):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("out", help="postprocess_combined.py output folder")
+    p.add_argument("out", type=Path, nargs="?", default=DATA, help="data folder")
     p.add_argument("--venous-delay", type=float, default=2.0, help="Seconds after the AIF peak where 'late' starts.")
     p.add_argument("--late-ratio", type=float, default=0.5, help="Late/early ratio above which a pixel counts as venous.")
     p.add_argument("--tie", type=float, default=0.02, help="venous_frac difference treated as a tie.")
@@ -127,7 +107,7 @@ def main():
     for (pid, n), g in sel[sel.eligible].groupby(["patient_id", "injection_number"]):
         g = g.assign(_vf=g.venous_frac_ica_top.fillna(np.inf), _tail=g.aif_tail_ica_top.fillna(np.inf))
         best = g.sort_values(["_vf", "_tail"]).iloc[0]
-        tied = lambda vf: (vf == best._vf) | ((vf - best._vf).abs() <= args.tie)  # also inf == inf (no metric)
+        tied = lambda vf: (vf == best._vf) | ((vf - best._vf).abs() <= args.tie)
         close = g[tied(g._vf)]
         if len(close) > 1:
             best = close.sort_values("_tail").iloc[0]
@@ -145,35 +125,8 @@ def main():
     sel = sel.drop(columns="eligible")
     sel.to_csv(out / "selection.csv", index=False)
 
-    # report section
     inc = sel[sel.included]
-    ex = sel[~sel.included]
-    first_reason = ex.reasons.str.split("; ").str[0].str.replace(r" of .*| \(.*", "", regex=True)
-    L = ["## Selection", "",
-         "One run per patient: ICA injection, not a duplicate, plane known, ica_top result available; of the A/B "
-         f"pair the plane with the least venous overlap in the ICA-top AIF mask (venous pixel: max concentration "
-         f"≥ {args.venous_delay:g} s after the AIF peak > {args.late_ratio:g} × max up to 1 s after it; ties within "
-         f"{args.tie:g} broken by the AIF tail ratio). See `selection.csv`.", "",
-         f"**Included: {len(inc)} runs from {inc.patient_id.nunique()} patients** "
-         f"(plane A: {int((inc.plane == 'A').sum())}, B: {int((inc.plane == 'B').sum())}; "
-         + ", ".join(f"{k}: {v}" for k, v in inc.evt_phase.value_counts().items()) + ").", "",
-         f"Excluded: {len(ex)} runs. First reason:", "",
-         "| reason | runs |", "|---|---|"]
-    L += [f"| {k} | {v} |" for k, v in first_reason.value_counts().items()]
-    L += ["", "EVT phase from SeriesDescription over all unique runs: "
-          + ", ".join(f"{k}: {v}" for k, v in sel[~sel.is_duplicate].evt_phase.value_counts().items())
-          + " (no pre-EVT runs in the data).", "",
-          "Venous overlap of the included runs, median [min–max]: "
-          + "; ".join(f"{v} {inc[f'venous_frac_{v}'].median():.3f} [{inc[f'venous_frac_{v}'].min():.3f}–"
-                      f"{inc[f'venous_frac_{v}'].max():.3f}]" for v in VARIANTS if inc[f"venous_frac_{v}"].notna().any())
-          + ".", "",
-          "| run_id | included | reasons |", "|---|---|---|"]
-    L += [f"| {r.run_id} | {'yes' if r.included else 'no'} | {r.reasons} |" for r in sel.sort_values("run_id").itertuples()]
-    report = out / "dataset_report.md"
-    text = report.read_text(encoding="utf-8") if report.exists() else ""
-    text = re.sub(r"\n## Selection\n.*", "", text, flags=re.S).rstrip() + "\n\n" + "\n".join(L) + "\n"
-    report.write_text(text, encoding="utf-8")
-    print(f"Included {len(inc)} runs from {inc.patient_id.nunique()} patients; excluded {len(ex)}.")
+    print(f"Included {len(inc)} runs from {inc.patient_id.nunique()} patients; excluded {len(sel) - len(inc)}.")
 
 
 if __name__ == "__main__":

@@ -1,30 +1,6 @@
-"""
-Merge two run_dataset.py outputs into one combined-cohort result with three AIF variants, and
-add the per-run bundle, extended tables and the dataset report.
+"""Merge raw_model/ and raw_grown/ into one result with three AIF variants (npz bundles, tables, dataset report).
 
-    ica_top         <raw_model>/maps/ica_top     (models/best_model_ica_top.pt)
-    ica_full_model  <raw_model>/maps/ica_full    (run_dataset.py --ica-full model, best_model_ica.pt)
-    ica_full_grown  <raw_grown>/maps/ica_full    (run_dataset.py --ica-full grown)
-
-Input : <out>/raw_model and <out>/raw_grown (run_dataset.py outputs made with --save-maps), the
-        DICOMs they point to, and PRAISE_BATCH_2/PRAISE.json.
-Output (in <out>):
-    acquisition_table.csv   run_dataset's columns + plane (unknown instead of defaulting to A),
-                            injection number per patient, injection site (+ source), A/B pair ID
-                            and offset, frame-rate pattern, acquisition start, duplicate flags
-    aif_curves.csv          run_id, variant, sampling (resampled_250ms | native), time_s, aif,
-                            time_from_arrival_s (time_s minus the run's ICA-top bolus arrival, optional
-                            alignment; time_s itself is not shifted or re-interpolated)
-    perfusion_summary.csv   run_dataset's perfusion summary, three variants
-    errors.csv              failed runs/variants with the reason
-    mask_overlap.csv        per run: pixel counts and Dice between the three masks
-    duplicates.csv          runs that are copies of another run
-    npz/<run_id>.npz        MINIP, the three masks, AIFs (resampled + native), CBV/CBF/MTT/Tmax
-    dataset_report.md       cohort description
-    _cache/<run_id>.json    per-run header/hash/native-AIF cache; delete to recompute
-
-Example:
-    python scripts/postprocess_combined.py results/combined_v1
+    python scripts/postprocess_combined.py
 """
 
 import argparse
@@ -40,6 +16,7 @@ import pandas as pd
 
 from cohort_common import (MAP_KEYS, ROOT, aif_from_frames, dice, load_native_sequence, load_variant_npz,
                            parse_source, rd)
+from paths import DATA
 
 # variant name -> (raw run folder, variant inside that run)
 SOURCES = {"ica_top": ("raw_model", "ica_top"),
@@ -49,9 +26,6 @@ VARIANTS = list(SOURCES)
 HEADER_TIME_RESOLUTION_MS = 1000  # AcquisitionTime is stored to the second in these exports
 
 
-# ----------------------------------------------------------------------------
-# Header-derived fields
-# ----------------------------------------------------------------------------
 def plane_or_unknown(ds):
     last = str(ds.get("ImageType", [""])[-1]).upper()
     m = re.search(r"(?:BIPLANE|SINGLE)\s+([AB])$", last)
@@ -131,9 +105,6 @@ def load_praise_json():
     return out
 
 
-# ----------------------------------------------------------------------------
-# Per-run pass: read the DICOM once -> header extras, pixel hash, MINIP, native AIFs, npz bundle
-# ----------------------------------------------------------------------------
 def process_run(out, row, masks_available):
     run_id = row["run_id"]
     ds = rd.read_dicom(parse_source(row["source"]))
@@ -159,7 +130,7 @@ def process_run(out, row, masks_available):
     try:
         frames, t_native = load_native_sequence(ds)
         uniform = rd.load_uniform_sequence(ds, 250, 1024)
-    except Exception as e:  # keep the header fields for the table
+    except Exception as e:
         info.update(variants=list(masks_available), native={}, bundle_error=repr(e))
         return info
     minip = uniform.min(axis=2)
@@ -211,9 +182,6 @@ def arrival_time(t, aif, frac=0.2):
     return float(np.interp(level, [aif[i - 1], aif[i]], [t[i - 1], t[i]]))
 
 
-# ----------------------------------------------------------------------------
-# Tables
-# ----------------------------------------------------------------------------
 def build_acquisition_table(acq, infos, praise_json):
     info = pd.DataFrame([{k: v for k, v in i.items() if k not in ("native", "variants")} for i in infos])
     acq = acq.drop(columns=["plane"]).merge(info, on="run_id", how="left")
@@ -283,7 +251,7 @@ def build_acquisition_table(acq, infos, praise_json):
             a, b = g[g.plane == "A"].iloc[0], g[g.plane == "B"].iloc[0]
             ta, tb = pd.to_datetime(a["acquisition_start"]), pd.to_datetime(b["acquisition_start"])
             offset = (tb - ta).total_seconds() * 1000
-            rows = acq.index[(acq.patient_id == pid) & (acq.injection_number == n)]  # incl. duplicates
+            rows = acq.index[(acq.patient_id == pid) & (acq.injection_number == n)]
             acq.loc[rows, "ab_pair_id"] = pair_id
             acq.loc[rows, "ab_offset_ms_header"] = offset
     acq["ab_offset_header_resolution_ms"] = np.where(acq["ab_pair_id"] != "", HEADER_TIME_RESOLUTION_MS, np.nan)
@@ -358,147 +326,11 @@ def build_mask_overlap(out, run_ids):
     return pd.DataFrame(rows)
 
 
-def check_top_consistency(out, run_ids):
-    """ica_top is computed in both raw runs; it should be identical."""
-    n, differ = 0, []
-    for run_id in run_ids:
-        a = load_variant_npz(out / "raw_model", "ica_top", run_id)
-        b = load_variant_npz(out / "raw_grown", "ica_top", run_id)
-        if a is None or b is None:
-            continue
-        n += 1
-        if not np.array_equal(a["mask"], b["mask"]):
-            differ.append(run_id)
-    return n, differ
-
-
-# ----------------------------------------------------------------------------
-# Report
-# ----------------------------------------------------------------------------
-def med_range(s, fmt="{:.3g}"):
-    s = pd.Series(s).dropna()
-    if not len(s):
-        return "n/a"
-    return f"{fmt.format(s.median())} [{fmt.format(s.min())}–{fmt.format(s.max())}]"
-
-
-def md_table(df):
-    df = df.reset_index() if df.index.name or isinstance(df.index, pd.MultiIndex) else df
-    cols = [str(c) for c in df.columns]
-    lines = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
-    for _, r in df.iterrows():
-        lines.append("| " + " | ".join("" if pd.isna(v) else str(v) for v in r.values) + " |")
-    return "\n".join(lines)
-
-
-def write_report(out, acq, perf, errors, overlap, top_check, praise_json):
-    uniq = acq[~acq.is_duplicate]
-    L = ["# Combined PRAISE cohort — dataset report", "",
-         f"Source: `{out.as_posix()}` — datasets PRAISE + PRAISE_BATCH_2, AIF variants: "
-         + ", ".join(f"`{v}`" for v in VARIANTS) + ".", "",
-         "Duplicates (see below) are counted once in the cohort numbers; they are still in all tables "
-         "(column `is_duplicate`).", "", "## Cohort", ""]
-    rows = []
-    for name, g_all in list(acq.groupby("dataset")) + [("all", acq)]:
-        g = g_all[~g_all.is_duplicate]
-        rows.append({"dataset": name, "patients": g.patient_id.nunique(), "runs (unique)": len(g),
-                     "runs incl. duplicates": len(g_all),
-                     "injections": g.drop_duplicates(["patient_id", "injection_number"]).shape[0],
-                     "injections / patient": med_range(g.groupby("patient_id").injection_number.nunique(), "{:.0f}"),
-                     "studies": g.study_date.astype(str).add(g.patient_id).nunique()})
-    L += [md_table(pd.DataFrame(rows)), ""]
-
-    L += ["## A/B planes", ""]
-    L += [md_table(uniq.groupby(["dataset", "plane"]).size().unstack(fill_value=0)), ""]
-    inj = uniq.groupby(["dataset", "patient_id", "injection_number"]).plane.apply(lambda p: "+".join(sorted(set(p))))
-    L += ["Planes per injection:", "", md_table(inj.groupby(level=0).value_counts().unstack(fill_value=0)), ""]
-    L += [f"Runs with plane `unknown` (no BIPLANE/SINGLE A/B in ImageType): {int((acq.plane == 'unknown').sum())}.", ""]
-
-    L += ["## Frame rate and duration", ""]
-    reg = uniq.groupby(["frame_rate_regime", "frame_interval_pattern"]).size().rename("runs").reset_index()
-    L += [f"Variable frame rate: {int(uniq.variable_frame_rate.sum())} of {len(uniq)} runs.", "",
-          md_table(reg.sort_values("runs", ascending=False)), ""]
-    dur = pd.DataFrame([{"dataset": d, "n_frames": med_range(g.n_frames, "{:.0f}"),
-                         "duration_s": med_range(g.duration_s), "frame_rate_fps (median interval)": med_range(g.frame_rate_fps)}
-                        for d, g in list(uniq.groupby("dataset")) + [("all", uniq)]])
-    L += ["Median [min–max]:", "", md_table(dur), ""]
-
-    L += ["## A/B timing offset", ""]
-    pairs = uniq[uniq.ab_pair_id != ""].drop_duplicates("ab_pair_id")
-    L += [f"{len(pairs)} A/B pairs. The headers hold no millisecond acquisition time per plane: AcquisitionTime "
-          f"is stored to the second (equal for A and B, or 1 s apart when the start straddles a second) and both "
-          f"planes share the FrameTimeVector, so the header offset only bounds the true offset to under ~1 s. "
-          f"Header offset (B − A, {HEADER_TIME_RESOLUTION_MS} ms resolution): "
-          + ", ".join(f"{v:g} ms: {n} pairs" for v, n in pairs.ab_offset_ms_header.value_counts().sort_index().items())
-          + ".", "",
-          "Data-derived offset (`ab_offset_ms_aif_arrival`): bolus arrival (20 % rise) of the native-time ICA-top "
-          "AIF, B minus A. It mixes any acquisition offset with the different vessel segment each plane sees, "
-          "and is limited by the frame interval (≥ 250 ms):", "",
-          f"- median [min–max]: {med_range(pairs.ab_offset_ms_aif_arrival, '{:.0f}')} ms; "
-          f"|offset| ≤ 250 ms in {int((pairs.ab_offset_ms_aif_arrival.abs() <= 250).sum())} of "
-          f"{int(pairs.ab_offset_ms_aif_arrival.notna().sum())} pairs.", ""]
-
-    L += ["## Injection sites", "",
-          "Source order: SeriesDescription → series folder name → PRAISE.json (only when its perf-eval path is "
-          "this run's folder). Side L/R and vessel ICA/CCA/ECA/VA parsed from the text.", ""]
-    L += [md_table(uniq.groupby(["injection_site", "injection_site_source"]).size().unstack(fill_value=0)), ""]
-    L += ["Per injection (unique, A/B counted once):", "",
-          md_table(uniq.drop_duplicates(["patient_id", "injection_number"]).injection_site.value_counts()
-                   .rename_axis("injection_site").rename("injections").reset_index()), ""]
-    listed = {k for k, v in praise_json.items() if v}
-    pts = {p.split("_")[0] for p in uniq.patient_id}
-    L += [f"PRAISE.json: {len(praise_json)} patients listed, {len(listed)} with a perf-eval run; "
-          f"{len(pts & listed)} of the {len(pts)} cohort patients have one, and "
-          f"{int((uniq.praise_json_perf_eval == 'yes').sum())} cohort runs are that run "
-          f"(column `praise_json_perf_eval`). Listed with a path but not in the data: "
-          f"{', '.join(sorted(listed - pts)) or 'none'}.", ""]
-
-    L += ["## Duplicates", ""]
-    dups = acq[acq.is_duplicate][["run_id", "duplicate_of", "duplicate_type", "duplicate_scope"]]
-    if len(dups):
-        L += [f"{len(dups)} runs are copies of another run:", "", md_table(dups.sort_values("run_id")), ""]
-        L += [f"Between batches: {int((dups.duplicate_scope == 'between batches').sum())}.", ""]
-    else:
-        L += ["None found (pixel hash and patient/acquisition time/series/plane/frames key).", ""]
-
-    L += ["## Failed runs", ""]
-    if len(errors):
-        e = errors.copy()
-        e["error"] = e["error"].astype(str).str.slice(0, 160)
-        L += [md_table(e[["run_id", "variant", "error"]].sort_values(["run_id", "variant"])), ""]
-    else:
-        L += ["None — every run produced all variants.", ""]
-    ok = perf.groupby("variant").run_id.nunique()
-    L += ["Runs with results per variant: " + ", ".join(f"{v}: {ok.get(v, 0)}" for v in VARIANTS) + ".", ""]
-
-    L += ["## Mask overlap between variants", ""]
-    if len(overlap):
-        rows = []
-        for a, b in (("ica_top", "ica_full_model"), ("ica_top", "ica_full_grown"), ("ica_full_model", "ica_full_grown")):
-            c = f"dice_{a}_vs_{b}"
-            if c in overlap:
-                rows.append({"pair": f"{a} vs {b}", "Dice": med_range(overlap[c]),
-                             "AIF Pearson r": med_range(overlap[f"aif_r_{a}_vs_{b}"]),
-                             "runs with Dice > 0.9": int((overlap[c] > 0.9).sum())})
-        L += [md_table(pd.DataFrame(rows)), ""]
-        if "dice_ica_top_vs_ica_full_grown" in overlap:
-            same = overlap[overlap["dice_ica_top_vs_ica_full_grown"] >= 0.999].run_id.tolist()
-            L += [f"`ica_full_grown` equals `ica_top` (nothing found to grow below the ICA top) in {len(same)} runs"
-                  + (f": {', '.join(same)}" if same else "") + ".", ""]
-        L += ["Mask size (px, 1024×1024): " + "; ".join(f"{v} {med_range(overlap[f'{v}_px'], '{:.0f}')}"
-                                                       for v in VARIANTS if f"{v}_px" in overlap) + ".", ""]
-    n, differ = top_check
-    L += [f"`ica_top` was computed in both raw runs: identical masks in {n - len(differ)} of {n} runs"
-          + (f" (differ: {', '.join(differ)})" if differ else "") + ".", ""]
-    (out / "dataset_report.md").write_text("\n".join(L), encoding="utf-8")
-
-
-# ----------------------------------------------------------------------------
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(message)s",
                         handlers=[logging.StreamHandler(sys.stdout)])
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("out", help="combined output folder holding raw_model/ and raw_grown/")
+    p.add_argument("out", type=Path, nargs="?", default=DATA, help="data folder")
     p.add_argument("--redo", action="store_true", help="Recompute the per-run cache and npz bundles.")
     p.add_argument("--available-only", action="store_true", help="Only runs that already have results (testing).")
     args = p.parse_args()
@@ -507,7 +339,7 @@ def main():
     cache.mkdir(exist_ok=True)
 
     acq = pd.read_csv(out / "raw_model" / "acquisition_table.csv")
-    if args.available_only:  # for testing while the raw runs are still going
+    if args.available_only:
         acq = acq[[bool(available_variants(out, r)) for r in acq.run_id]]
     infos = []
     for i, row in enumerate(acq.to_dict("records"), 1):
@@ -541,8 +373,7 @@ def main():
     build_aif_curves(out, run_ids, infos, dict(zip(table.run_id, table.aif_arrival_s_ica_top))).to_csv(out / "aif_curves.csv", index=False)
     overlap = build_mask_overlap(out, run_ids)
     overlap.to_csv(out / "mask_overlap.csv", index=False)
-    write_report(out, table, perf, errors, overlap, check_top_consistency(out, run_ids), praise_json)
-    logging.info("Wrote tables, %d npz bundles and dataset_report.md to %s", len(list((out / "npz").glob("*.npz"))), out)
+    logging.info("Wrote tables and %d npz bundles to %s", len(list((out / "npz").glob("*.npz"))), out)
 
 
 if __name__ == "__main__":

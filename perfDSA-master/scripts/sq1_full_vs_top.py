@@ -1,56 +1,16 @@
-"""
-SQ1 — effect of the sampling segment: AIF from the full ICA (ica_full_model, ica_full_grown) versus the
-supraclinoid ICA top (ica_top), per plane.
+"""SQ1: full-ICA AIF (model, grown) vs supraclinoid ICA top, paired per plane.
 
-Pairs
-    One pair per run and comparison (model vs top, grown vs top): both curves of the run must be trusted
-    (aif_taxonomy.py trust flag), so a pair never contains a rejected curve. Per plane separately, because the
-    projection changes which part of the ICA each mask covers.
-
-Differences (full - top)
-    timing features (s): plain difference; amplitude and perfusion features (strictly positive, error
-    proportional to size): log ratio, reported as % (exp(d) - 1); dimensionless shape features: difference.
-    `temporal r` (Pearson r of the full and top curve, features.csv r_vs_top) is summarised, not tested.
-
-Normality and test choice
-    Shapiro-Wilk on the paired differences of every feature x comparison x plane, plus Q-Q plots
-    (qq_<comparison>.png). Pre-specified rule: paired t-test if Shapiro-Wilk p >= 0.05, else Wilcoxon
-    signed-rank (the test does not assume normality, only a symmetric difference distribution). Both p-values
-    are kept in the table; the reported one follows the rule.
-    Holm correction over the features within one family = one comparison in one plane.
-
-Agreement
-    Bland-Altman per feature (ba_<comparison>.png): bias = mean difference, limits of agreement = bias +/-
-    1.96 SD; when the differences are not normal also the non-parametric limits (2.5th-97.5th percentile).
-    Log-ratio features are plotted on the log scale against the geometric mean.
-
-Plane interaction ("does the direction flip?")
-    For injections with a pair in both planes: Wilcoxon signed-rank on d_B - d_A (does the full-vs-top
-    difference differ between the views), and the sign of the median difference per plane.
-    Candidate explanations, Spearman correlation of d with (plane_difference/plane_runs.csv):
-        pixel count     log(mask_px full / top)
-        overlap         ring_vessel_frac full - top (vessels around the mask), venous_frac full - top
-        foreshortening  ica_top mask_px (a foreshortened siphon projects onto fewer, denser pixels) and
-                        mask_spread of the top mask
-
-Input : <out>/aif_features/features_aif.csv, features.csv (r_vs_top), plane_difference/plane_runs.csv,
-        aif_qc/taxonomy/taxonomy_labels.csv (spread_px)
-Output: <out>/sq1_full_vs_top/
-    sq1_pairs.csv, sq1_tests.csv, sq1_interaction.csv, sq1_flip_correlations.csv, table_sq1.tex,
-    qq_<comparison>.png, ba_<comparison>.png, forest.png, sq1_report.md
-
-Example:
-    python scripts/sq1_full_vs_top.py results/combined_v1
+    python scripts/sq1_full_vs_top.py
 """
 
 import argparse
-import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
 from scipy import stats
+from paths import DATA, PLANE, SQ1
 
 COMPARISONS = {"model": "ica_full_model", "grown": "ica_full_grown"}
 PLANES = ["A", "B"]
@@ -75,9 +35,6 @@ FEATURES = {
 }
 
 
-# ----------------------------------------------------------------------------
-# Pairs
-# ----------------------------------------------------------------------------
 def make_pairs(feat, r_top):
     top = feat[feat.variant == "ica_top"].set_index("run_id")
     rows = []
@@ -95,9 +52,6 @@ def make_pairs(feat, r_top):
     return pd.DataFrame(rows)
 
 
-# ----------------------------------------------------------------------------
-# Statistics
-# ----------------------------------------------------------------------------
 def holm(p):
     p = np.asarray(p, dtype=float)
     out = np.full_like(p, np.nan)
@@ -115,7 +69,17 @@ def fmt_effect(x, scale):
     return f"{np.expm1(x):+.1%}" if scale == "log" else (f"{x:+.3f} s" if scale == "s" else f"{x:+.3f}")
 
 
+def rank_biserial(d):
+    """Matched-pairs rank-biserial correlation; zero differences are dropped, as in the Wilcoxon test."""
+    nz = d[d != 0]
+    if nz.empty:
+        return np.nan
+    r = stats.rankdata(nz.abs())
+    return (r[nz > 0].sum() - r[nz < 0].sum()) / r.sum()
+
+
 def tests(pairs):
+    """Wilcoxon signed-rank for every feature; Shapiro-Wilk and the paired t-test are kept as sensitivity checks."""
     rows = []
     for comp in COMPARISONS:
         for plane in PLANES:
@@ -127,21 +91,21 @@ def tests(pairs):
                 sw = stats.shapiro(d)
                 t = stats.ttest_1samp(d, 0.0)
                 w = stats.wilcoxon(d) if (d != 0).sum() > 5 else None
-                normal = sw.pvalue >= ALPHA
                 sd = d.std(ddof=1)
                 rows.append(dict(
                     comparison=comp, plane=plane, feature=c, label=label, scale=scale, n=len(d),
-                    shapiro_W=sw.statistic, shapiro_p=sw.pvalue, normal=normal,
-                    test="paired t" if normal else "Wilcoxon", p_t=t.pvalue, p_wilcoxon=w.pvalue if w else np.nan,
-                    p=t.pvalue if normal else (w.pvalue if w else np.nan),
+                    n_zero=int((d == 0).sum()), shapiro_W=sw.statistic, shapiro_p=sw.pvalue,
+                    test="Wilcoxon", p_t=t.pvalue, p=w.pvalue if w else np.nan, rank_biserial=rank_biserial(d),
                     mean=d.mean(), sd=sd, median=d.median(), q1=d.quantile(0.25), q3=d.quantile(0.75),
                     ba_bias=d.mean(), ba_loa_low=d.mean() - 1.96 * sd, ba_loa_high=d.mean() + 1.96 * sd,
                     np_loa_low=d.quantile(0.025), np_loa_high=d.quantile(0.975),
-                    effect=fmt_effect(d.median() if not normal else d.mean(), scale)))
+                    effect=fmt_effect(d.median(), scale)))
     t = pd.DataFrame(rows)
     t["p_holm"] = np.nan
+    t["p_t_holm"] = np.nan
     for (comp, plane), idx in t.groupby(["comparison", "plane"]).groups.items():
         t.loc[idx, "p_holm"] = holm(t.loc[idx, "p"])
+        t.loc[idx, "p_t_holm"] = holm(t.loc[idx, "p_t"])
     t["significant"] = t.p_holm < ALPHA
     return t
 
@@ -194,37 +158,7 @@ def flip_correlations(pairs, runs, geo):
     return pd.DataFrame(rows)
 
 
-# ----------------------------------------------------------------------------
-# Figures
-# ----------------------------------------------------------------------------
 PLANE_COL = {"A": "#2a78d6", "B": "#eb6834"}
-
-
-def plot_qq(pairs, comp, path):
-    feats = list(FEATURES)
-    ncol = 5
-    nrow = int(np.ceil(len(feats) / ncol))
-    fig, axes = plt.subplots(nrow, ncol, figsize=(3.2 * ncol, 3 * nrow), squeeze=False)
-    p = pairs[pairs.comparison == comp]
-    for ax, c in zip(axes.flat, feats):
-        for plane in PLANES:
-            d = p[p.plane == plane][f"d_{c}"].dropna()
-            if len(d) < 3:
-                continue
-            (osm, osr), (slope, icpt, _) = stats.probplot(d, dist="norm")
-            ax.scatter(osm, osr, s=8, color=PLANE_COL[plane], label=plane)
-            ax.plot(osm, slope * osm + icpt, color=PLANE_COL[plane], lw=0.8)
-        ax.set_title(FEATURES[c][0], fontsize=9)
-        ax.tick_params(labelsize=7)
-    for ax in axes.flat[len(feats):]:
-        ax.axis("off")
-    axes.flat[0].legend(fontsize=7, title="plane", title_fontsize=7)
-    fig.suptitle(f"Q-Q plots of the paired differences, {COMPARISONS[comp]} - ica_top")
-    fig.supxlabel("theoretical normal quantile")
-    fig.supylabel("observed difference")
-    fig.tight_layout()
-    fig.savefig(path, dpi=90)
-    plt.close(fig)
 
 
 def plot_ba(pairs, t, comp, path):
@@ -290,28 +224,19 @@ def plot_forest(t, path):
     plt.close(fig)
 
 
-# ----------------------------------------------------------------------------
-# Report
-# ----------------------------------------------------------------------------
-def md_table(df):
-    cols = [str(c) for c in df.columns]
-    rows = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
-    rows += ["| " + " | ".join("" if pd.isna(x) else str(x) for x in r) + " |" for r in df.itertuples(index=False)]
-    return "\n".join(rows)
-
-
 def fmt_p(x):
     return "" if pd.isna(x) else (f"{x:.1e}" if x < 0.001 else f"{x:.3f}")
 
 
 def tex_table(t, path):
     lines = ["\\begin{table*}[t]", "\\centering",
-             "\\caption{SQ1: full ICA minus ICA top, per plane (pairs with both curves trusted). Effect: mean "
-             "(paired t) or median (Wilcoxon) of the difference; ratio features as \\%. $p$: Holm-corrected within "
-             "comparison and plane; test chosen by Shapiro-Wilk ($p<0.05$: Wilcoxon).}",
-             "\\label{tab:sq1}", "\\footnotesize", "\\begin{tabular}{l" + "rr" * 4 + "}", "\\hline",
-             " & \\multicolumn{4}{c}{ica\\_full\\_model $-$ top} & \\multicolumn{4}{c}{ica\\_full\\_grown $-$ top} \\\\",
-             "Feature & A & $p$ & B & $p$ & A & $p$ & B & $p$ \\\\", "\\hline"]
+             "\\caption{SQ1: full ICA minus ICA top, per plane (pairs with both curves trusted). Effect: median of "
+             "the difference; ratio features as \\%, times in s. $p$: Wilcoxon signed-rank, Holm-corrected within "
+             "comparison and plane. $r$: rank-biserial correlation.}",
+             "\\label{tab:sq1}", "\\footnotesize", "\\setlength{\\tabcolsep}{3pt}",
+             "\\begin{tabular}{l" + "rrr" * 4 + "}", "\\hline",
+             " & \\multicolumn{6}{c}{ica\\_full\\_model $-$ top} & \\multicolumn{6}{c}{ica\\_full\\_grown $-$ top} \\\\",
+             "Feature" + " & A & $p$ & $r$ & B & $p$ & $r$" * 2 + " \\\\", "\\hline"]
     for c, (label, _) in FEATURES.items():
         cells = []
         for comp in COMPARISONS:
@@ -320,135 +245,27 @@ def tex_table(t, path):
                 if len(r):
                     r = r.iloc[0]
                     eff = r.effect.replace("%", "\\%").replace(" s", "")
-                    mark = "$^\\dagger$" if r.test == "Wilcoxon" else ""
-                    cells += [eff + mark, fmt_p(r.p_holm)]
+                    cells += [eff, fmt_p(r.p_holm), f"{r.rank_biserial:+.2f}" if pd.notna(r.p) else ""]
                 else:
-                    cells += ["", ""]
+                    cells += ["", "", ""]
         lines.append(f"{label} & " + " & ".join(cells) + " \\\\")
-    lines += ["\\hline", "\\multicolumn{9}{l}{$^\\dagger$ Wilcoxon signed-rank (non-normal differences); "
-              "otherwise paired $t$-test. Times in s.} \\\\", "\\end{tabular}", "\\end{table*}"]
+    lines += ["\\hline", "\\end{tabular}", "\\end{table*}"]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def mask_context(pairs, runs):
-    """Median mask size and overlap of each mask, per plane, over the pairs of each comparison."""
-    r = runs.set_index(["run_id", "variant"])
-    rows = []
-    for comp, variant in COMPARISONS.items():
-        for plane in PLANES:
-            ids = pairs[(pairs.comparison == comp) & (pairs.plane == plane)].run_id
-            for v in ("ica_top", variant):
-                sub = r.loc[list(zip(ids, [v] * len(ids)))]
-                rows.append(dict(comparison=comp, plane=plane, mask=v, mask_px=int(sub.mask_px.median()),
-                                 ring_vessel_frac=round(sub.ring_vessel_frac.median(), 3),
-                                 venous_frac=round(sub.venous_frac.median(), 3)))
-    return pd.DataFrame(rows)
-
-
-def write_report(out_dir, pairs, t, inter, corr, ctx, command):
-    n = pairs.groupby(["comparison", "plane"]).size().unstack()
-    r_t = pairs.groupby(["comparison", "plane"]).temporal_r.median().unstack().round(4)
-    tt = t.assign(shapiro_p=t.shapiro_p.map(fmt_p), p_t=t.p_t.map(fmt_p), p_wilcoxon=t.p_wilcoxon.map(fmt_p),
-                  p_holm=t.p_holm.map(fmt_p))
-    nn = t.groupby(["comparison", "plane"]).normal.agg(["sum", "size"])
-    ba = t.copy()
-    for col in ["ba_bias", "ba_loa_low", "ba_loa_high", "np_loa_low", "np_loa_high"]:
-        ba[col] = [fmt_effect(v, s) for v, s in zip(ba[col], ba.scale)]
-    sig_corr = corr[(corr.p < 0.01) & (corr.plane != "both")].sort_values("p").round(3)
-    dis = t[t.p_wilcoxon.notna() & ((t.p_t < ALPHA) != (t.p_wilcoxon < ALPHA))]
-    disagree = len(dis)
-    dis_list = [f"{r.comparison} {r.plane} {r.label}" for r in dis.itertuples()]
-    ii = inter.assign(p=inter.p.map(fmt_p), p_holm=inter.p_holm.map(fmt_p))
-    txt = f"""# SQ1 — full ICA vs ICA top ({out_dir.parent.name})
-
-Generated by `scripts/sq1_full_vs_top.py`; do not edit by hand, re-run instead.
-
-```bash
-{command}
-```
-
-Pairs (both curves trusted), per comparison and plane:
-
-{md_table(n.reset_index())}
-
-Temporal agreement (median Pearson r of the full and the top curve):
-
-{md_table(r_t.reset_index())}
-
-## 1. Normality of the paired differences
-
-Shapiro-Wilk per feature x comparison x plane (Q-Q plots: `qq_model.png`, `qq_grown.png`). Normal (p >= 0.05)
-in this many of the features:
-
-{md_table(nn.rename(columns={"sum": "normal", "size": "features"}).reset_index())}
-
-Rule (pre-specified): paired t-test when normal, else Wilcoxon signed-rank. Both p-values are in `sq1_tests.csv`.
-Robustness of the choice: the two tests disagree on p < 0.05 (uncorrected) for {disagree} of {len(t)} tests
-{f"({', '.join(dis_list)})" if dis_list else ""}.
-
-## 2. Paired tests per plane, Holm-corrected
-
-Holm over the {len(FEATURES)} features of one comparison in one plane. LaTeX: `table_sq1.tex`; forest plot: `forest.png`.
-
-{md_table(tt[["comparison", "plane", "label", "n", "shapiro_p", "test", "effect", "p_t", "p_wilcoxon", "p_holm"]])}
-
-## 3. Bland-Altman
-
-Bias and 95 % limits of agreement of full - top (ratio features as %); `ba_model.png`, `ba_grown.png`.
-Non-parametric limits (2.5th-97.5th percentile) for the non-normal features.
-
-{md_table(ba[["comparison", "plane", "label", "normal", "ba_bias", "ba_loa_low", "ba_loa_high", "np_loa_low", "np_loa_high"]])}
-
-## 4. Does the direction flip between planes?
-
-Injections with a pair in both planes: median difference per plane, `flips` = opposite sign, Wilcoxon on
-d_B - d_A (Holm within comparison):
-
-{md_table(ii)}
-
-Candidate explanations (Spearman of the full - top difference with pixel count, overlap and foreshortening
-proxies; `sq1_flip_correlations.csv`). Correlations with p < 0.01:
-
-{md_table(sig_corr) if len(sig_corr) else "None."}
-
-Factors: `log_px_ratio` = log(mask px full / top) (pixel count); `d_ring_vessel`, `d_venous` = full - top
-vessel fraction around the mask / late-opacifying fraction (overlap); `top_px`, `top_spread` = size and spread
-of the ica_top mask (a foreshortened siphon projects onto fewer pixels).
-
-Mask context per plane (medians over the pairs):
-
-{md_table(ctx)}
-
-Reading: the vessel fraction around the ica_top mask is much higher in the lateral view (B) than in the frontal
-view (A), whereas around the grown (cervical + petrous) mask it is similar in both views. Of the candidate
-factors, only this overlap difference correlates consistently with the full - top difference (pixel count and
-the foreshortening proxies do not). The correlation does not tell which of the two curves moves; the
-plane-difference analysis (plane_difference/) does: normalised to the whole-image contrast, the ica_top AIF is
-the same in both views (B/A 1.00) while the grown AIF is lower in B (0.84). The view dependence therefore sits
-in the grown AIF, and a lower AIF raises CBV/CBF/MTT (the deconvolution divides tissue by AIF).
-
-## Caveats
-
-- Pairs require both curves to be trusted, so runs where one mask fails drop out; the comparison is about
-  the effect of the segment when both extractions are valid.
-- Exploratory correlations (section 4) are not corrected for multiple testing.
-"""
-    (out_dir / "sq1_report.md").write_text(txt, encoding="utf-8")
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("out", type=Path, help="combined result folder, e.g. results/combined_v1")
+    p.add_argument("out", type=Path, nargs="?", default=DATA, help="data folder")
     args = p.parse_args()
     out = args.out
-    out_dir = out / "sq1_full_vs_top"
+    out_dir = SQ1
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    feat = pd.read_csv(out / "aif_features" / "features_aif.csv")
+    feat = pd.read_csv(out / "features" / "features_aif.csv")
     old = pd.read_csv(out / "features.csv")
     r_top = old.set_index(["run_id", "variant"]).r_vs_top.to_dict()
-    runs = pd.read_csv(out / "plane_difference" / "plane_runs.csv")
-    geo = pd.read_csv(out / "aif_qc" / "taxonomy" / "taxonomy_labels.csv")[["run_id", "variant", "spread_px"]]
+    runs = pd.read_csv(PLANE / "plane_runs.csv")
+    geo = pd.read_csv(out / "qc" / "taxonomy" / "taxonomy_labels.csv")[["run_id", "variant", "spread_px"]]
 
     pairs = make_pairs(feat, r_top)
     pairs.to_csv(out_dir / "sq1_pairs.csv", index=False)
@@ -459,11 +276,9 @@ def main():
     corr = flip_correlations(pairs, runs, geo)
     corr.to_csv(out_dir / "sq1_flip_correlations.csv", index=False)
     for comp in COMPARISONS:
-        plot_qq(pairs, comp, out_dir / f"qq_{comp}.png")
         plot_ba(pairs, t, comp, out_dir / f"ba_{comp}.png")
     plot_forest(t, out_dir / "forest.png")
     tex_table(t, out_dir / "table_sq1.tex")
-    write_report(out_dir, pairs, t, inter, corr, mask_context(pairs, runs), " ".join(["python"] + sys.argv))
     print(pairs.groupby(["comparison", "plane"]).size().unstack())
     print(t[["comparison", "plane", "label", "test", "effect", "p_holm"]].to_string())
     print(inter.to_string())

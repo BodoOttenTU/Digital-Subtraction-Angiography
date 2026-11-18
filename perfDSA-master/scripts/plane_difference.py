@@ -1,55 +1,9 @@
-"""
-Why do plane A (frontal) and plane B (lateral) of the same injection give different AIFs? Two candidate
-sources (meeting 19 Oct): the amount of contrast medium the detector sees, and vessel overlap.
+"""Plane A vs B: whole-image contrast and vessel overlap per injection.
 
-Both planes image the same bolus at the same time, so any A/B difference is the projection: geometry,
-exposure and what lies in front of / behind the ICA. Per injection (A/B pair, both planes present, not a
-duplicate) and per AIF variant:
-
-Contrast medium
-    global_peak, global_auc   whole-image contrast signal: sum over all pixels of (1 - frame/170) minus
-                              the first frame, times the pixel area at the isocentre (mm^2), its maximum
-                              and its integral over time. For an ideal projection (Beer-Lambert, whole
-                              head in the field) this is the projected iodine mass and is the same in
-                              both views; what differs is exposure (kVp: iodine attenuates more at lower
-                              kVp), scatter, collimation and the display scaling of the subtracted images.
-    aif_peak, aif_auc         the AIF (features.csv)
-    aif_rel_peak              aif_peak / global_peak (x 1e4): the AIF relative to all contrast in the
-                              image, i.e. the global scaling removed. What is left is vessel-specific:
-                              the chord length of the ray through the ICA (foreshortening of the siphon)
-                              and overlap.
-Vessel overlap
-    venous_frac               fraction of mask pixels still opaque in the venous phase (select_runs.py)
-    ring_vessel_frac          fraction of a RING_PX-wide ring around the mask that is vessel in the MINIP
-                              (MINIP < VESSEL_LEVEL): how crowded the neighbourhood of the ICA is in this
-                              view; a crowded ring means the mask edge and its partial-volume pixels
-                              average other vessels
-    projection_overlap        the taxonomy class (aif_taxonomy.py) per plane
-Acquisition
-    kvp, dap, magnification, field_of_view_mm (acquisition_table.csv)
-
-Statistics: paired Wilcoxon signed-rank test B vs A (Holm-corrected over the features of one variant),
-median of the paired log-ratio B/A (or difference for fractions). Then which factor explains the AIF
-difference: Spearman correlation of log(aif_peak B/A) with log(global_peak B/A), delta kVp, delta
-venous_frac and delta ring_vessel_frac, and the share of log(aif_peak B/A) left after removing the
-global scaling.
-
-Input : <out>/features.csv, acquisition_table.csv, npz/, aif_qc/taxonomy/taxonomy_labels.csv, DICOMs
-Output: <out>/plane_difference/
-    plane_runs.csv            one row per run x variant with every feature
-    plane_pairs.csv           one row per pair x variant: A, B, ratio / difference
-    plane_tests.csv           Wilcoxon per feature x variant
-    plane_correlations.csv    Spearman of the AIF ratio with the candidate factors
-    plane_difference.png      paired plots and the decomposition
-    table_plane_difference.tex
-    plane_difference_report.md
-
-Example:
-    python scripts/plane_difference.py results/combined_v1
+    python scripts/plane_difference.py
 """
 
 import argparse
-import sys
 from pathlib import Path
 
 import cv2 as cv
@@ -59,6 +13,7 @@ from matplotlib import pyplot as plt
 from scipy.stats import spearmanr, wilcoxon
 
 from cohort_common import parse_source, rd
+from paths import DATA, PLANE
 
 VARIANTS = ["ica_top", "ica_full_model", "ica_full_grown"]
 FRAME_INTERVAL_MS = 250
@@ -81,9 +36,6 @@ FEATURES = {
 }
 
 
-# ----------------------------------------------------------------------------
-# Per-run measurements
-# ----------------------------------------------------------------------------
 def global_signal(frames, px_area_mm2):
     """Whole-image contrast signal over time (first frame subtracted), in grey-level fraction x mm^2."""
     s = (1 - frames / 170).sum(axis=(0, 1))
@@ -117,9 +69,6 @@ def measure(out, acq, feat):
     return pd.DataFrame(rows)
 
 
-# ----------------------------------------------------------------------------
-# Pairs and statistics
-# ----------------------------------------------------------------------------
 def holm(p):
     """Holm-Bonferroni adjusted p-values (statsmodels is not in the BEP environment)."""
     p = np.asarray(p, dtype=float)
@@ -192,9 +141,6 @@ def variance_share(pairs):
     return pd.DataFrame(rows)
 
 
-# ----------------------------------------------------------------------------
-# Output
-# ----------------------------------------------------------------------------
 PLANE_COL = {"A": "#2a78d6", "B": "#eb6834"}
 
 
@@ -229,13 +175,6 @@ def plot(pairs, runs, path):
     plt.close(fig)
 
 
-def md_table(df):
-    cols = [str(c) for c in df.columns]
-    rows = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
-    rows += ["| " + " | ".join("" if pd.isna(x) else str(x) for x in r) + " |" for r in df.itertuples(index=False)]
-    return "\n".join(rows)
-
-
 def fmt_p(x):
     return "" if pd.isna(x) else (f"{x:.1e}" if x < 0.001 else f"{x:.3f}")
 
@@ -254,102 +193,18 @@ def tex_table(t, n_pairs, path):
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def write_report(out_dir, t, corr, share, pairs, command):
-    tt = t.assign(p=t.p.map(fmt_p), p_holm=t.p_holm.map(fmt_p), median_A=t.median_A.round(3),
-                  median_B=t.median_B.round(3))
-    po = pairs.groupby("variant").agg(pairs=("ab_pair_id", "size"),
-                                      overlap_A=("projection_overlap_A", "sum"), overlap_B=("projection_overlap_B", "sum"),
-                                      trusted_A=("trust_A", lambda s: (s == "trusted").sum()),
-                                      trusted_B=("trust_B", lambda s: (s == "trusted").sum())).reindex(VARIANTS)
-    top = t[(t.variant == "ica_top")].set_index("feature")
-    sh = share.set_index("variant")
-    txt = f"""# Plane difference: contrast medium and vessel overlap — {out_dir.parent.name}
-
-Generated by `scripts/plane_difference.py`; do not edit by hand, re-run instead.
-
-```bash
-{command}
-```
-
-Both planes image the same bolus at the same moment, so every A/B difference comes from the projection.
-{pairs.ab_pair_id.nunique()} A/B pairs (both planes present, duplicates left out). Figure: `plane_difference.png`;
-LaTeX (ica_top): `table_plane_difference.tex`.
-
-## Paired differences
-
-Ratio B/A (log scale features) or difference B - A; median and IQR over the pairs; paired Wilcoxon, Holm over
-the features of one variant.
-
-{md_table(tt[["variant", "label", "kind", "n", "median_A", "median_B", "effect", "effect_iqr", "p", "p_holm"]])}
-
-## Contrast medium seen by the detector
-
-- Plane B is acquired at a lower tube voltage (median kVp B - A {top.loc["kvp", "effect"]}) with about a third of the
-  dose-area product (DAP B/A {top.loc["dap", "effect"]}). Iodine attenuates more at lower kVp (closer to its
-  K-edge at 33 keV), so the same iodine gives more contrast in B.
-- Whole-image contrast signal (projected iodine; same for both views in an ideal projection): B/A
-  {top.loc["global_peak", "effect"]} at the peak ({top.loc["global_peak", "effect_iqr"]}), p_Holm
-  {fmt_p(top.loc["global_peak", "p_holm"])}.
-- AIF peak (ica_top) B/A {top.loc["aif_peak", "effect"]} ({top.loc["aif_peak", "effect_iqr"]}), p_Holm
-  {fmt_p(top.loc["aif_peak", "p_holm"])}; AIF AUC B/A {top.loc["aif_auc", "effect"]}.
-- After dividing by the whole-image signal, the vessel-specific AIF ratio is {top.loc["aif_rel_peak", "effect"]}
-  ({top.loc["aif_rel_peak", "effect_iqr"]}), p_Holm {fmt_p(top.loc["aif_rel_peak", "p_holm"])}.
-
-Spread of the AIF ratio and how much of it the global scaling explains:
-
-{md_table(share.round(3))}
-
-Two different questions:
-- **The systematic shift** (median over pairs): dividing by the whole-image signal moves the ica_top AIF ratio
-  from {top.loc["aif_peak", "effect"]} to {top.loc["aif_rel_peak", "effect"]}, so the higher AIF in plane B is
-  the same scaling that makes the whole image brighter (lower kVp, exposure/display), not something of the ICA.
-- **The pair-to-pair spread** is not reduced by it (SD of log ratio {sh.loc["ica_top", "sd_log_aif"]:.3f} ->
-  {sh.loc["ica_top", "sd_log_aif_rel"]:.3f}; "variance explained" {sh.loc["ica_top", "var_explained_by_global"]:.0%},
-  negative = the correction adds noise): per pair, the whole-image signal is a noisy proxy (field of view,
-  collimation, how much of the head is in the image), and the remaining scatter is vessel-specific (siphon
-  foreshortening, overlap; see below).
-
-## Vessel overlap
-
-Per plane: curves classified `projection_overlap` by the taxonomy and trusted curves:
-
-{md_table(po.reset_index())}
-
-- Venous fraction of the mask B - A: {top.loc["venous_frac", "effect"]} ({top.loc["venous_frac", "effect_iqr"]}),
-  p_Holm {fmt_p(top.loc["venous_frac", "p_holm"])}.
-- Vessel fraction in a {RING_PX} px ring around the mask B - A: {top.loc["ring_vessel_frac", "effect"]}
-  ({top.loc["ring_vessel_frac", "effect_iqr"]}), p_Holm {fmt_p(top.loc["ring_vessel_frac", "p_holm"])}.
-
-## What goes with the AIF difference?
-
-Spearman correlation over the pairs:
-
-{md_table(corr.assign(rho=corr.rho.round(2), p=corr.p.map(fmt_p)))}
-
-## Caveats
-
-- The subtracted images are display-processed (PixelIntensityRelationship DISP): grey levels are proportional
-  to iodine only up to the vendor's display scaling, which may differ per run. The whole-image signal absorbs
-  this scaling, which is why the vessel-specific ratio is the cleaner measure of the projection effect.
-- The field of view may cut off part of the head differently in the two views, which lowers the whole-image
-  signal of that view.
-- Correlations over ~{len(pairs[pairs.variant == "ica_top"])} pairs are exploratory (not corrected for the number of factors).
-"""
-    (out_dir / "plane_difference_report.md").write_text(txt, encoding="utf-8")
-
-
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("out", type=Path, help="combined result folder, e.g. results/combined_v1")
+    p.add_argument("out", type=Path, nargs="?", default=DATA, help="data folder")
     args = p.parse_args()
     out = args.out
-    out_dir = out / "plane_difference"
+    out_dir = PLANE
     out_dir.mkdir(parents=True, exist_ok=True)
 
     acq = pd.read_csv(out / "acquisition_table.csv").set_index("run_id")
     feat = pd.read_csv(out / "features.csv")
     feat = feat[~feat.is_duplicate & feat.plane.isin(["A", "B"])]
-    tax = pd.read_csv(out / "aif_qc" / "taxonomy" / "taxonomy_labels.csv")[
+    tax = pd.read_csv(out / "qc" / "taxonomy" / "taxonomy_labels.csv")[
         ["run_id", "variant", "taxonomy", "trust", "venous_frac"]]
     cache = out_dir / "plane_runs_measured.csv"
     if cache.exists():
@@ -375,7 +230,6 @@ def main():
     share = variance_share(pairs)
     plot(pairs, runs, out_dir / "plane_difference.png")
     tex_table(t, int((pairs.variant == "ica_top").sum()), out_dir / "table_plane_difference.tex")
-    write_report(out_dir, t, corr, share, pairs, " ".join(["python"] + sys.argv))
     print(t[t.variant == "ica_top"][["label", "effect", "effect_iqr", "p_holm"]].to_string())
     print(share.to_string())
 
